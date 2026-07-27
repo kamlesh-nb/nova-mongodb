@@ -1,0 +1,6 @@
+{
+  "name": "nova-mongodb",
+  "version": "0.1.0",
+  "type": "console",
+  "dependencies": []
+}

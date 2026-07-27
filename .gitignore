@@ -1,0 +1,6 @@
+consumer_bin
+*.o
+*.ll
+.nova/
+__nova_test
+merged.nova

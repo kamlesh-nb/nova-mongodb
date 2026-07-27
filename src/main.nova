@@ -1,0 +1,18 @@
+// Demo: build MongoDB commands and show the OP_MSG wire framing offline (no server).
+import mongodb;
+import serde.bson;
+
+fn main(): void {
+    let hello = mongodb.helloCommand("admin");
+    let frame = mongodb.encodeOpMsg(1, hello);
+    console.log("hello command OP_MSG frame length:");
+    console.log(frame.length as int);
+
+    // Round-trip proves the codec: encode -> decode -> read a field back.
+    let back = mongodb.decodeOpMsg(frame);
+    let dbIdx = bson.docFind(back, "$db");
+    console.log("decoded $db field:");
+    console.log(bson.docGetString(back, dbIdx));
+
+    console.log("nova-mongodb driver: OP_MSG + BSON + SCRAM-SHA-256 ready");
+}
