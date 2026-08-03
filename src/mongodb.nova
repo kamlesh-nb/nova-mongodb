@@ -17,7 +17,7 @@ import list;
 import serde.bson;
 import crypto.scram;
 import crypto.base64;
-import net.asyncio;
+import net.aio;
 import db;
 
 const OP_MSG: int = 2013;
@@ -140,7 +140,7 @@ pub fn saslContinueCommand(dbName: string, conversationId: int, clientFinal: str
 // ---------------------------------------------------------------------------
 
 // A1 async-first seam: read exactly `n` bytes into a fresh string, parking on each recv.
-async fn readExact(io: asyncio.AsyncStream, n: int): string {
+async fn readExact(io: aio.AsyncStream, n: int): string {
     let buf = bytes.alloc(n);
     let got = 0;
     while (got < n) {
@@ -151,7 +151,7 @@ async fn readExact(io: asyncio.AsyncStream, n: int): string {
     return buf as string;
 }
 // Read a full OP_MSG frame (16-byte header carries messageLength, then the rest). Parks.
-async fn readFrame(io: asyncio.AsyncStream): string {
+async fn readFrame(io: aio.AsyncStream): string {
     let head = await readExact(io, HEADER_LEN);
     let total = bytes.read_i32(head as ptr, 0);
     let rest = await readExact(io, total - HEADER_LEN);
@@ -164,11 +164,11 @@ async fn readFrame(io: asyncio.AsyncStream): string {
 }
 
 pub struct MongoConnection impl Connection {
-    pub io: asyncio.AsyncStream,
+    pub io: aio.AsyncStream,
     pub dbName: string,
     pub nextId: int,
 
-    init(io: asyncio.AsyncStream, dbName: string) {
+    init(io: aio.AsyncStream, dbName: string) {
         self.io = io;
         self.dbName = dbName;
         self.nextId = 1;
@@ -242,7 +242,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
     let portStr = if (portEnd >= 0) string.slice(rest, 0, portEnd) else rest;
     let dbName = if (portEnd >= 0) string.slice(rest, portEnd + 1, rest.length) else "test";
     let port = string.parseI64(portStr);
-    let stream = await asyncio.asyncConnect(host, if (port > 0) port else 27017);
+    let stream = await aio.asyncConnect(host, if (port > 0) port else 27017);
     return MongoConnection(stream, dbName);
 }
 
