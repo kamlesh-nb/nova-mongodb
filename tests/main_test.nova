@@ -121,3 +121,13 @@ fn nib(c: int): int {
     if (c >= 97 && c <= 102) { return c - 97 + 10; }
     return 0;
 }
+
+@test
+fn test_doc_to_json(): void {
+    // T5: BSON -> JSON so find() can return documents.
+    let d = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    d.entries.push(bson.entryString("name", "ada"));
+    d.entries.push(bson.entryInt("age", 42));
+    d.entries.push(bson.entryBool("active", 1));
+    assert.equalStr(bson.docToJson(d), "{\"name\":\"ada\",\"age\":42,\"active\":true}");
+}
