@@ -181,11 +181,13 @@ pub struct MongoConnection impl Connection {
     pub io: aio.AsyncIO,
     pub dbName: string,
     pub nextId: int,
+    pub busy: bool,              // concurrency guard: one in-flight request per connection
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
         self.dbName = dbName;
         self.nextId = 1;
+        self.busy = false;
     }
 
     // Send one OP_MSG command and await the reply (the recv parks the coroutine).
@@ -215,17 +217,21 @@ pub struct MongoConnection impl Connection {
     // one "document" text cell holding the document's JSON. (getMore for batches beyond firstBatch is a
     // follow-on; firstBatch covers the common small-result case.)
     pub async fn query(self: MongoConnection, sql: string, params: List<DbValue>): ResultSet {
+        // A connection is a single request/response channel; a second concurrent query would interleave
+        // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
+        if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
         let rs = ResultSet();
         let err = commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
-        if (!err.isEmpty()) { rs.err = err; return rs; }
+        if (!err.isEmpty()) { rs.err = err; self.busy = false; return rs; }
         rs.columns.push(Column("document", DbType.Text));
 
         let cursorIdx = bson.docFind(reply, "cursor");
-        if (cursorIdx < 0) { return rs; }
+        if (cursorIdx < 0) { self.busy = false; return rs; }
         let cursorDoc = bson.deserialize(bson.docGetDoc(reply, cursorIdx) as ptr);
         let fbIdx = bson.docFind(cursorDoc, "firstBatch");
-        if (fbIdx < 0) { return rs; }
+        if (fbIdx < 0) { self.busy = false; return rs; }
         // firstBatch is a BSON array (a document keyed "0","1",...); each entry is a result document.
         let fbArray = bson.deserialize(bson.docGetArray(cursorDoc, fbIdx) as ptr);
         let i = 0;
@@ -236,14 +242,18 @@ pub struct MongoConnection impl Connection {
             rs.rows.push(row);
             i = i + 1;
         }
+        self.busy = false;
         return rs;
     }
 
     pub async fn exec(self: MongoConnection, sql: string, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
         let err = commandError(reply);
-        if (!err.isEmpty()) { return errorExec(err); }
+        if (!err.isEmpty()) { self.busy = false; return errorExec(err); }
         let okIdx = bson.docFind(reply, "ok");
+        self.busy = false;
         return ExecResult((if (okIdx >= 0) 1 else 0) as long, "");
     }
 
