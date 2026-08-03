@@ -163,6 +163,17 @@ async fn readFrame(io: aio.AsyncStream): string {
     return full as string;
 }
 
+// A failed MongoDB command replies with { ok: 0.0, errmsg: string, code: int }; a success has no
+// errmsg. BSON has no double accessor here, so presence of `errmsg` is the reliable failure signal.
+pub fn commandError(reply: bson.BsonDocument): DbError {
+    let emIdx = bson.docFind(reply, "errmsg");
+    if (emIdx < 0) { return noError(); }
+    let msg = bson.docGetString(reply, emIdx);
+    let codeIdx = bson.docFind(reply, "code");
+    let code = if (codeIdx >= 0) `${bson.docGetInt(reply, codeIdx)}` else "";
+    return DbError(code, msg);
+}
+
 pub struct MongoConnection impl Connection {
     pub io: aio.AsyncStream,
     pub dbName: string,
@@ -200,6 +211,8 @@ pub struct MongoConnection impl Connection {
     pub async fn query(self: MongoConnection, sql: string, params: List<DbValue>): ResultSet {
         let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
         let rs = ResultSet();
+        let err = commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
+        if (!err.isEmpty()) { rs.err = err; return rs; }
         let okIdx = bson.docFind(reply, "ok");
         let row = Row();
         row.cells.push(db.dbInt(if (okIdx >= 0) 1 else 0));
@@ -209,6 +222,8 @@ pub struct MongoConnection impl Connection {
 
     pub async fn exec(self: MongoConnection, sql: string, params: List<DbValue>): ExecResult {
         let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
+        let err = commandError(reply);
+        if (!err.isEmpty()) { return errorExec(err); }
         let okIdx = bson.docFind(reply, "ok");
         return ExecResult((if (okIdx >= 0) 1 else 0) as long, "");
     }

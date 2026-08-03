@@ -68,3 +68,21 @@ fn test_scram_flow_matches_rfc7677(): void {
     assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")), clientFinal);
     assert.equalInt(bson.docGetInt(back, bson.docFind(back, "conversationId")), 1);
 }
+
+// T1: a failed command reply ({ok:0, errmsg, code}) is now surfaced by query/exec via commandError
+// (previously the driver only checked whether `ok` existed and reported success).
+@test
+fn test_command_error_surfacing(): void {
+    let fail = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    fail.entries.push(bson.entryInt("ok", 0));
+    fail.entries.push(bson.entryString("errmsg", "ns not found"));
+    fail.entries.push(bson.entryInt("code", 26));
+    let e = mongodb.commandError(fail);
+    assert.isTrue(!e.isEmpty());
+    assert.equalStr(e.message, "ns not found");
+    assert.equalStr(e.code, "26");
+
+    let good = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    good.entries.push(bson.entryInt("ok", 1));
+    assert.isTrue(mongodb.commandError(good).isEmpty());
+}
