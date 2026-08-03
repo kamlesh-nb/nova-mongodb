@@ -265,6 +265,13 @@ pub struct MongoConnection impl Connection {
     pub async fn execPrepared(self: MongoConnection, stmt: int, params: List<DbValue>): ExecResult {
         return await self.exec("", params);
     }
+
+    // MongoDB transactions are SESSION-based (startTransaction on an lsid + causal consistency), not the
+    // SQL BEGIN/COMMIT/ROLLBACK model. The seam methods are no-ops here (returning ok) so the trait is
+    // satisfied; real multi-document transactions are a follow-on requiring session support.
+    pub async fn begin(self: MongoConnection): ExecResult { return ExecResult(0, "NOOP"); }
+    pub async fn commit(self: MongoConnection): ExecResult { return ExecResult(0, "NOOP"); }
+    pub async fn rollback(self: MongoConnection): ExecResult { return ExecResult(0, "NOOP"); }
 }
 
 // Whole connect (+ optional SCRAM auth) as ONE async fn, driven once by the sync Driver.connect.
