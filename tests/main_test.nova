@@ -86,3 +86,38 @@ fn test_command_error_surfacing(): void {
     good.entries.push(bson.entryInt("ok", 1));
     assert.isTrue(mongodb.commandError(good).isEmpty());
 }
+
+// T3: a BSON document with an ObjectId (_id, type 0x07) + datetime must deserialize without desyncing
+// the parser -- previously types 7/9/17 were unhandled, so any real Mongo reply (every _id is an
+// ObjectId) misparsed. Hand-build { _id: ObjectId(00112233445566778899aabb), n: 42 } and read both.
+@test
+fn test_bson_objectid_decode(): void {
+    let oidHex = "00112233445566778899aabb";
+    // total(4) + [0x07 "_id\0" 12] + [0x10 "n\0" int32] + 0x00 = 29 bytes.
+    let d = bytes.alloc(29);
+    bytes.write_byte(d, 0, 29); bytes.write_byte(d, 1, 0); bytes.write_byte(d, 2, 0); bytes.write_byte(d, 3, 0);
+    let p = 4;
+    bytes.write_byte(d, p, 0x07); p = p + 1;
+    bytes.write_byte(d, p, 95); bytes.write_byte(d, p+1, 105); bytes.write_byte(d, p+2, 100); bytes.write_byte(d, p+3, 0); p = p + 4;  // "_id\0"
+    let k = 0;
+    while (k < 12) { bytes.write_byte(d, p + k, (nib(oidHex[k*2])*16) + nib(oidHex[k*2+1])); k = k + 1; }
+    p = p + 12;
+    bytes.write_byte(d, p, 0x10); p = p + 1;
+    bytes.write_byte(d, p, 110); bytes.write_byte(d, p+1, 0); p = p + 2;  // "n\0"
+    bytes.write_byte(d, p, 42); bytes.write_byte(d, p+1, 0); bytes.write_byte(d, p+2, 0); bytes.write_byte(d, p+3, 0); p = p + 4;
+    bytes.write_byte(d, p, 0);
+
+    let doc = bson.deserialize(d as ptr);
+    let idIdx = bson.docFind(doc, "_id");
+    assert.isTrue(idIdx >= 0);
+    assert.equalStr(bson.docGetObjectId(doc, idIdx), oidHex);
+    // The int AFTER the ObjectId is still read correctly -> the parser did not desync.
+    let nIdx = bson.docFind(doc, "n");
+    assert.isTrue(nIdx >= 0);
+    assert.equalInt(bson.docGetInt(doc, nIdx), 42);
+}
+fn nib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    return 0;
+}
