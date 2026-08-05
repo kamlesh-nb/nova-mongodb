@@ -1,0 +1,76 @@
+// commands — MongoDB command builders (SRP: build the BSON documents that are the
+// protocol's "commands", + read a command's error out of a reply). Each builder returns a
+// BSON document ready for codec.encodeOpMsg. A "command" is just a BSON document,
+// e.g. { find: "users", $db: "test" }.
+import list;
+import serde.bson;
+import db;
+
+pub fn newDoc(): bson.BsonDocument {
+    return bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+}
+
+/// { hello: 1, $db: <db> } — the connection handshake command.
+pub fn helloCommand(dbName: string): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("hello", 1));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+// Wrap one document as the single-element array { "0": <doc> } (BSON arrays are
+// documents whose keys are the decimal indices).
+fn singletonArray(doc: bson.BsonDocument): ptr {
+    let arr = newDoc();
+    arr.entries.push(bson.entryDoc("0", bson.serialize(doc)));
+    return bson.serialize(arr);
+}
+
+/// { insert: <coll>, documents: [<doc>], $db: <db> }.
+pub fn insertCommand(dbName: string, coll: string, doc: bson.BsonDocument): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("insert", coll));
+    d.entries.push(bson.entryArray("documents", singletonArray(doc)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { find: <coll>, filter: <filter>, $db: <db> }.
+pub fn findCommand(dbName: string, coll: string, filter: bson.BsonDocument): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("find", coll));
+    d.entries.push(bson.entryDoc("filter", bson.serialize(filter)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { saslStart: 1, mechanism: "SCRAM-SHA-256", payload: <bin>, $db: <db> }.
+pub fn saslStartCommand(dbName: string, clientFirst: string): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("saslStart", 1));
+    d.entries.push(bson.entryString("mechanism", "SCRAM-SHA-256"));
+    d.entries.push(bson.entryBinary("payload", clientFirst));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { saslContinue: 1, conversationId: <id>, payload: <bin>, $db: <db> }.
+pub fn saslContinueCommand(dbName: string, conversationId: int, clientFinal: string): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("saslContinue", 1));
+    d.entries.push(bson.entryInt("conversationId", conversationId));
+    d.entries.push(bson.entryBinary("payload", clientFinal));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+// A failed MongoDB command replies with { ok: 0.0, errmsg: string, code: int }; a success has no
+// errmsg. BSON has no double accessor here, so presence of `errmsg` is the reliable failure signal.
+pub fn commandError(reply: bson.BsonDocument): DbError {
+    let emIdx = bson.docFind(reply, "errmsg");
+    if (emIdx < 0) { return noError(); }
+    let msg = bson.docGetString(reply, emIdx);
+    let codeIdx = bson.docFind(reply, "code");
+    let code = if (codeIdx >= 0) `${bson.docGetInt(reply, codeIdx)}` else "";
+    return DbError(code, msg);
+}

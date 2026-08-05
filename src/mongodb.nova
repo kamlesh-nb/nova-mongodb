@@ -1,145 +1,32 @@
 // nova-mongodb — a MongoDB driver for Nova, distributed as a PACKAGE.
 //
-// It depends only on the Nova standard library (the DB seam + BSON + the SCRAM
-// crypto from crypto/scram), and is consumed via `nova get`. It speaks the
-// MongoDB wire protocol directly:
+// This module is the SEAM: MongoConnection (impl Connection) + MongoDriver (impl Driver)
+// + the connect/handshake/auth orchestration. Every other responsibility lives in its own
+// module (SOLID/SRP):
 //
-//   OP_MSG (opcode 2013): [ 16-byte MsgHeader | uint32 flagBits | section... ]
-//   section kind 0x00: a single BSON document (the command / the reply).
+//   codec     the OP_MSG wire codec        (encodeOpMsg / decodeOpMsg / frameLength)
+//   commands  BSON command builders        (hello/insert/find/saslStart/... + commandError)
 //
-// A "command" is just a BSON document, e.g. { find: "users", $db: "test" }.
-// Auth is SCRAM-SHA-256 (RFC 5802/7677) via crypto.scram — the payloads ride in
-// BSON binary fields.
+// Consumers only touch MongoDriver/MongoConnection: `import mongodb; MongoDriver()`.
+// It depends only on the Nova standard library (the DB seam + BSON + SCRAM crypto) and is
+// consumed via `nova get`. Auth is SCRAM-SHA-256 (RFC 5802/7677) via crypto.scram — the
+// payloads ride in BSON binary fields.
 
 import bytes;
 import string;
 import list;
 import serde.bson;
 import crypto.scram;
-import crypto.base64;
 import crypto.random;
 import net.aio;
 import net.asynctls;
 import io.file;
 import db;
-
-const OP_MSG: int = 2013;
-const HEADER_LEN: int = 16;
-// header(16) + flagBits(4) + section-kind(1) = 21 bytes before the BSON body.
-const BODY_OFFSET: int = 21;
+import codec;
+import commands;
 
 // ---------------------------------------------------------------------------
-// OP_MSG wire codec
-// ---------------------------------------------------------------------------
-
-/// Wrap a command document in an OP_MSG frame. Returns the raw frame bytes.
-pub fn encodeOpMsg(requestId: int, command: bson.BsonDocument): string {
-    // `bson.serialize` returns a fresh rc=1 buffer; adopt it as a string so ARC
-    // frees it at scope end (a bare `ptr` is a value type and would leak).
-    let body: string = bson.serialize(command) as string;
-    let bsonLen = bytes.read_i32(body as ptr, 0);
-    let total = BODY_OFFSET + bsonLen;
-
-    let frame = bytes.alloc(total);
-    bytes.write_i32(frame, 0, total);       // messageLength
-    bytes.write_i32(frame, 4, requestId);   // requestID
-    bytes.write_i32(frame, 8, 0);           // responseTo
-    bytes.write_i32(frame, 12, OP_MSG);     // opCode
-    bytes.write_i32(frame, 16, 0);          // flagBits
-    bytes.write_byte(frame, 20, 0);         // section kind 0 (body)
-    let i = 0;
-    while (i < bsonLen) {
-        bytes.write_byte(frame, BODY_OFFSET + i, bytes.read_byte(body, i));
-        i = i + 1;
-    }
-    return frame as string;
-}
-
-/// Parse the command document out of an OP_MSG reply frame.
-pub fn decodeOpMsg(frame: string): bson.BsonDocument {
-    let bsonLen = bytes.read_i32(frame as ptr, BODY_OFFSET);
-    let buf = bytes.alloc(bsonLen);
-    let i = 0;
-    while (i < bsonLen) {
-        bytes.write_byte(buf, i, bytes.read_byte(frame, BODY_OFFSET + i));
-        i = i + 1;
-    }
-    // Adopt the decode buffer as a string so ARC frees it; `deserialize` copies
-    // everything out, so releasing it after is safe.
-    let bufStr: string = buf as string;
-    return bson.deserialize(bufStr as ptr);
-}
-
-/// The total length declared in an OP_MSG frame header (its first int32).
-pub fn frameLength(frame: string): int {
-    return bytes.read_i32(frame as ptr, 0);
-}
-
-// ---------------------------------------------------------------------------
-// Command builders (each returns a BSON document ready for encodeOpMsg)
-// ---------------------------------------------------------------------------
-
-fn newDoc(): bson.BsonDocument {
-    return bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
-}
-
-/// { hello: 1, $db: <db> } — the connection handshake command.
-pub fn helloCommand(dbName: string): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryInt("hello", 1));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-// Wrap one document as the single-element array { "0": <doc> } (BSON arrays are
-// documents whose keys are the decimal indices).
-fn singletonArray(doc: bson.BsonDocument): ptr {
-    let arr = newDoc();
-    arr.entries.push(bson.entryDoc("0", bson.serialize(doc)));
-    return bson.serialize(arr);
-}
-
-/// { insert: <coll>, documents: [<doc>], $db: <db> }.
-pub fn insertCommand(dbName: string, coll: string, doc: bson.BsonDocument): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("insert", coll));
-    d.entries.push(bson.entryArray("documents", singletonArray(doc)));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// { find: <coll>, filter: <filter>, $db: <db> }.
-pub fn findCommand(dbName: string, coll: string, filter: bson.BsonDocument): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("find", coll));
-    d.entries.push(bson.entryDoc("filter", bson.serialize(filter)));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// { saslStart: 1, mechanism: "SCRAM-SHA-256", payload: <bin>, $db: <db> }.
-pub fn saslStartCommand(dbName: string, clientFirst: string): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryInt("saslStart", 1));
-    d.entries.push(bson.entryString("mechanism", "SCRAM-SHA-256"));
-    d.entries.push(bson.entryBinary("payload", clientFirst));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// { saslContinue: 1, conversationId: <id>, payload: <bin>, $db: <db> }.
-pub fn saslContinueCommand(dbName: string, conversationId: int, clientFinal: string): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryInt("saslContinue", 1));
-    d.entries.push(bson.entryInt("conversationId", conversationId));
-    d.entries.push(bson.entryBinary("payload", clientFinal));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Connection (live socket)
+// Live socket framing
 // ---------------------------------------------------------------------------
 
 // A1 async-first seam: read exactly `n` bytes into a fresh string, parking on each recv.
@@ -155,26 +42,15 @@ async fn readExact(io: aio.AsyncIO, n: int): string {
 }
 // Read a full OP_MSG frame (16-byte header carries messageLength, then the rest). Parks.
 async fn readFrame(io: aio.AsyncIO): string {
-    let head = await readExact(io, HEADER_LEN);
+    let head = await readExact(io, codec.HEADER_LEN);
     let total = bytes.read_i32(head as ptr, 0);
-    let rest = await readExact(io, total - HEADER_LEN);
+    let rest = await readExact(io, total - codec.HEADER_LEN);
     let full = bytes.alloc(total);
     let i = 0;
-    while (i < HEADER_LEN) { bytes.write_byte(full, i, bytes.read_byte(head, i)); i = i + 1; }
+    while (i < codec.HEADER_LEN) { bytes.write_byte(full, i, bytes.read_byte(head, i)); i = i + 1; }
     let j = 0;
-    while (j < total - HEADER_LEN) { bytes.write_byte(full, HEADER_LEN + j, bytes.read_byte(rest, j)); j = j + 1; }
+    while (j < total - codec.HEADER_LEN) { bytes.write_byte(full, codec.HEADER_LEN + j, bytes.read_byte(rest, j)); j = j + 1; }
     return full as string;
-}
-
-// A failed MongoDB command replies with { ok: 0.0, errmsg: string, code: int }; a success has no
-// errmsg. BSON has no double accessor here, so presence of `errmsg` is the reliable failure signal.
-pub fn commandError(reply: bson.BsonDocument): DbError {
-    let emIdx = bson.docFind(reply, "errmsg");
-    if (emIdx < 0) { return noError(); }
-    let msg = bson.docGetString(reply, emIdx);
-    let codeIdx = bson.docFind(reply, "code");
-    let code = if (codeIdx >= 0) `${bson.docGetInt(reply, codeIdx)}` else "";
-    return DbError(code, msg);
 }
 
 pub struct MongoConnection impl Connection {
@@ -194,21 +70,21 @@ pub struct MongoConnection impl Connection {
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
         let id = self.nextId;
         self.nextId = id + 1;
-        let frame = encodeOpMsg(id, command);
+        let frame = codec.encodeOpMsg(id, command);
         let dummy = await self.io.sendStr(frame);
-        return decodeOpMsg(await readFrame(self.io));
+        return codec.decodeOpMsg(await readFrame(self.io));
     }
 
     pub async fn authenticate(self: MongoConnection, username: string, password: string, clientNonce: string): bool {
         let c = scram.ScramClient{ username: username, password: password, clientNonce: clientNonce };
-        let start = await self.runCommand(saslStartCommand(self.dbName, c.clientFirstMessage()));
+        let start = await self.runCommand(commands.saslStartCommand(self.dbName, c.clientFirstMessage()));
         let convIdx = bson.docFind(start, "conversationId");
         let payloadIdx = bson.docFind(start, "payload");
         if (convIdx < 0 || payloadIdx < 0) { return false; }
         let conversationId = bson.docGetInt(start, convIdx);
         let serverFirst = bson.docGetBinary(start, payloadIdx);
         let clientFinal = c.clientFinalMessage(serverFirst);
-        let cont = await self.runCommand(saslContinueCommand(self.dbName, conversationId, clientFinal));
+        let cont = await self.runCommand(commands.saslContinueCommand(self.dbName, conversationId, clientFinal));
         let doneIdx = bson.docFind(cont, "done");
         return doneIdx >= 0 && bson.docGetBool(cont, doneIdx) != 0;
     }
@@ -221,9 +97,9 @@ pub struct MongoConnection impl Connection {
         // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
+        let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
         let rs = ResultSet();
-        let err = commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
+        let err = commands.commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
         if (!err.isEmpty()) { rs.err = err; self.busy = false; return rs; }
         rs.columns.push(Column("document", DbType.Text));
 
@@ -249,8 +125,8 @@ pub struct MongoConnection impl Connection {
     pub async fn exec(self: MongoConnection, sql: string, params: List<DbValue>): ExecResult {
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let reply = await self.runCommand(findCommand(self.dbName, sql, newDoc()));
-        let err = commandError(reply);
+        let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
+        let err = commands.commandError(reply);
         if (!err.isEmpty()) { self.busy = false; return errorExec(err); }
         let okIdx = bson.docFind(reply, "ok");
         self.busy = false;
@@ -284,7 +160,6 @@ pub struct MongoConnection impl Connection {
     pub async fn rollback(self: MongoConnection): ExecResult { return ExecResult(0, "NOOP"); }
 }
 
-// Whole connect (+ optional SCRAM auth) as ONE async fn, driven once by the sync Driver.connect.
 // Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
 fn dsnParam(dsn: string, key: string, dflt: string): string {
     let needle = key + "=";
@@ -301,7 +176,7 @@ fn dsnParam(dsn: string, key: string, dflt: string): string {
 // stream into this AsyncIO param is a widening (the safe direction).
 async fn mongoFinish(io: aio.AsyncIO, dbName: string, user: string, pass: string): MongoConnection {
     let conn = MongoConnection(io, dbName);
-    let hi = await conn.runCommand(helloCommand(dbName));   // handshake -- was never sent before
+    let hi = await conn.runCommand(commands.helloCommand(dbName));   // handshake -- was never sent before
     if (user != "") {
         // authenticate against the auth db (the connection db here). Nonce is generated per-connection
         // from the CSPRNG (never caller-supplied / reused).

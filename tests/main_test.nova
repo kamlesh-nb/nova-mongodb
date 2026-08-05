@@ -1,6 +1,7 @@
 // Offline codec gate for the nova-mongodb driver: OP_MSG framing, command shapes,
 // BSON round-trips, and the SCRAM message flow — all verified WITHOUT a server.
-import mongodb;
+import codec;
+import commands;
 import serde.bson;
 import crypto.scram;
 import bytes;
@@ -9,16 +10,16 @@ import assert;
 
 @test
 fn test_opmsg_roundtrip(): void {
-    let cmd = mongodb.helloCommand("admin");
-    let frame = mongodb.encodeOpMsg(7, cmd);
+    let cmd = commands.helloCommand("admin");
+    let frame = codec.encodeOpMsg(7, cmd);
 
     // Header: messageLength == actual length; opcode == 2013 (OP_MSG); requestID == 7.
-    assert.equalInt(mongodb.frameLength(frame), frame.length);
+    assert.equalInt(codec.frameLength(frame), frame.length);
     assert.equalInt(bytes.read_i32(frame as ptr, 12), 2013);
     assert.equalInt(bytes.read_i32(frame as ptr, 4), 7);
 
     // Decode recovers the command document.
-    let back = mongodb.decodeOpMsg(frame);
+    let back = codec.decodeOpMsg(frame);
     assert.isTrue(bson.docFind(back, "hello") >= 0);
     assert.equalStr(bson.docGetString(back, bson.docFind(back, "$db")), "admin");
 }
@@ -27,15 +28,15 @@ fn test_opmsg_roundtrip(): void {
 fn test_find_and_insert_commands(): void {
     let filter = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
     filter.entries.push(bson.entryString("name", "ada"));
-    let find = mongodb.findCommand("test", "users", filter);
-    let back = mongodb.decodeOpMsg(mongodb.encodeOpMsg(1, find));
+    let find = commands.findCommand("test", "users", filter);
+    let back = codec.decodeOpMsg(codec.encodeOpMsg(1, find));
     assert.equalStr(bson.docGetString(back, bson.docFind(back, "find")), "users");
     assert.equalStr(bson.docGetString(back, bson.docFind(back, "$db")), "test");
 
     let doc = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
     doc.entries.push(bson.entryString("name", "ada"));
-    let ins = mongodb.insertCommand("test", "users", doc);
-    let backIns = mongodb.decodeOpMsg(mongodb.encodeOpMsg(2, ins));
+    let ins = commands.insertCommand("test", "users", doc);
+    let backIns = codec.decodeOpMsg(codec.encodeOpMsg(2, ins));
     assert.equalStr(bson.docGetString(backIns, bson.docFind(backIns, "insert")), "users");
 }
 
@@ -44,8 +45,8 @@ fn test_saslstart_payload_binary(): void {
     // The SCRAM client-first-message rides in a BSON binary payload; verify it
     // survives an encode -> decode of the whole OP_MSG frame.
     let c = scram.ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
-    let cmd = mongodb.saslStartCommand("admin", c.clientFirstMessage());
-    let back = mongodb.decodeOpMsg(mongodb.encodeOpMsg(1, cmd));
+    let cmd = commands.saslStartCommand("admin", c.clientFirstMessage());
+    let back = codec.decodeOpMsg(codec.encodeOpMsg(1, cmd));
     assert.equalStr(bson.docGetString(back, bson.docFind(back, "mechanism")), "SCRAM-SHA-256");
     assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")),
                     "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
@@ -63,8 +64,8 @@ fn test_scram_flow_matches_rfc7677(): void {
         "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
 
     // And that client-final rides correctly in a saslContinue payload.
-    let cont = mongodb.saslContinueCommand("admin", 1, clientFinal);
-    let back = mongodb.decodeOpMsg(mongodb.encodeOpMsg(3, cont));
+    let cont = commands.saslContinueCommand("admin", 1, clientFinal);
+    let back = codec.decodeOpMsg(codec.encodeOpMsg(3, cont));
     assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")), clientFinal);
     assert.equalInt(bson.docGetInt(back, bson.docFind(back, "conversationId")), 1);
 }
@@ -77,14 +78,14 @@ fn test_command_error_surfacing(): void {
     fail.entries.push(bson.entryInt("ok", 0));
     fail.entries.push(bson.entryString("errmsg", "ns not found"));
     fail.entries.push(bson.entryInt("code", 26));
-    let e = mongodb.commandError(fail);
+    let e = commands.commandError(fail);
     assert.isTrue(!e.isEmpty());
     assert.equalStr(e.message, "ns not found");
     assert.equalStr(e.code, "26");
 
     let good = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
     good.entries.push(bson.entryInt("ok", 1));
-    assert.isTrue(mongodb.commandError(good).isEmpty());
+    assert.isTrue(commands.commandError(good).isEmpty());
 }
 
 // T3: a BSON document with an ObjectId (_id, type 0x07) + datetime must deserialize without desyncing

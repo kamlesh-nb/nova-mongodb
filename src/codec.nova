@@ -1,0 +1,56 @@
+// codec — the OP_MSG wire codec (SRP: bytes <-> frame). Wraps a BSON command
+// document in an OP_MSG frame and pulls the reply document back out. Pure over byte
+// buffers; the live socket framing (read a whole frame off the stream) is in the seam.
+//
+//   OP_MSG (opcode 2013): [ 16-byte MsgHeader | uint32 flagBits | section... ]
+//   section kind 0x00: a single BSON document (the command / the reply).
+import bytes;
+import serde.bson;
+
+const OP_MSG: int = 2013;
+pub const HEADER_LEN: int = 16;   // MsgHeader; the seam reads this first to learn the length
+// header(16) + flagBits(4) + section-kind(1) = 21 bytes before the BSON body.
+const BODY_OFFSET: int = 21;
+
+/// Wrap a command document in an OP_MSG frame. Returns the raw frame bytes.
+pub fn encodeOpMsg(requestId: int, command: bson.BsonDocument): string {
+    // `bson.serialize` returns a fresh rc=1 buffer; adopt it as a string so ARC
+    // frees it at scope end (a bare `ptr` is a value type and would leak).
+    let body: string = bson.serialize(command) as string;
+    let bsonLen = bytes.read_i32(body as ptr, 0);
+    let total = BODY_OFFSET + bsonLen;
+
+    let frame = bytes.alloc(total);
+    bytes.write_i32(frame, 0, total);       // messageLength
+    bytes.write_i32(frame, 4, requestId);   // requestID
+    bytes.write_i32(frame, 8, 0);           // responseTo
+    bytes.write_i32(frame, 12, OP_MSG);     // opCode
+    bytes.write_i32(frame, 16, 0);          // flagBits
+    bytes.write_byte(frame, 20, 0);         // section kind 0 (body)
+    let i = 0;
+    while (i < bsonLen) {
+        bytes.write_byte(frame, BODY_OFFSET + i, bytes.read_byte(body, i));
+        i = i + 1;
+    }
+    return frame as string;
+}
+
+/// Parse the command document out of an OP_MSG reply frame.
+pub fn decodeOpMsg(frame: string): bson.BsonDocument {
+    let bsonLen = bytes.read_i32(frame as ptr, BODY_OFFSET);
+    let buf = bytes.alloc(bsonLen);
+    let i = 0;
+    while (i < bsonLen) {
+        bytes.write_byte(buf, i, bytes.read_byte(frame, BODY_OFFSET + i));
+        i = i + 1;
+    }
+    // Adopt the decode buffer as a string so ARC frees it; `deserialize` copies
+    // everything out, so releasing it after is safe.
+    let bufStr: string = buf as string;
+    return bson.deserialize(bufStr as ptr);
+}
+
+/// The total length declared in an OP_MSG frame header (its first int32).
+pub fn frameLength(frame: string): int {
+    return bytes.read_i32(frame as ptr, 0);
+}
