@@ -40,6 +40,10 @@ pub fn findCommand(dbName: string, coll: string, filter: bson.BsonDocument): bso
     let d = newDoc();
     d.entries.push(bson.entryString("find", coll));
     d.entries.push(bson.entryDoc("filter", bson.serialize(filter)));
+    // Request a large first batch so the whole result comes back in `firstBatch` without a getMore
+    // round-trip. MongoDB's default first batch is only 101 documents, which silently truncated any
+    // larger collection (the driver reads firstBatch only; cursor draining via getMore is a follow-on).
+    d.entries.push(bson.entryInt("batchSize", 100000));
     d.entries.push(bson.entryString("$db", dbName));
     return d;
 }

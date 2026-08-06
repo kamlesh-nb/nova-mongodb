@@ -30,21 +30,28 @@ import commands;
 // ---------------------------------------------------------------------------
 
 // A1 async-first seam: read exactly `n` bytes into a fresh string, parking on each recv.
+// Read EXACTLY n bytes, or return "" on a short read (closed / half-open socket). Returning a
+// truncated buffer silently let readFrame parse a garbage length off a partial header.
 async fn readExact(io: aio.AsyncIO, n: int): string {
+    if (n <= 0) { return ""; }
     let buf = bytes.alloc(n);
     let got = 0;
     while (got < n) {
         let r = await io.recvInto((buf + got) as int, n - got);
-        if (r <= 0) { break; }
+        if (r <= 0) { bytes.free(buf); return ""; }
         got = got + r;
     }
     return buf as string;
 }
 // Read a full OP_MSG frame (16-byte header carries messageLength, then the rest). Parks.
+// Returns "" if the connection closes mid-frame or the declared length is out of bounds.
 async fn readFrame(io: aio.AsyncIO): string {
     let head = await readExact(io, codec.HEADER_LEN);
+    if (head.length < codec.HEADER_LEN) { return ""; }               // closed before a full header
     let total = bytes.read_i32(head as ptr, 0);
+    if (total < codec.HEADER_LEN || total > 67108864) { return ""; } // bound the alloc (64 MiB ceiling)
     let rest = await readExact(io, total - codec.HEADER_LEN);
+    if (total > codec.HEADER_LEN && rest.length < total - codec.HEADER_LEN) { return ""; }  // truncated body
     let full = bytes.alloc(total);
     let i = 0;
     while (i < codec.HEADER_LEN) { bytes.write_byte(full, i, bytes.read_byte(head, i)); i = i + 1; }
@@ -58,13 +65,20 @@ pub struct MongoConnection impl Connection {
     pub dbName: string,
     pub nextId: int,
     pub busy: bool,              // concurrency guard: one in-flight request per connection
+    pub failed: bool,            // set when connect/auth failed: the connection is dead
+    pub failErr: string,         // the failure reason surfaced to the first query/exec
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
         self.dbName = dbName;
         self.nextId = 1;
         self.busy = false;
+        self.failed = false;
+        self.failErr = "";
     }
+    // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
+    // instead of pretending to be live (auth used to be checked-but-ignored).
+    pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
 
     // Send one OP_MSG command and await the reply (the recv parks the coroutine).
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
@@ -95,6 +109,7 @@ pub struct MongoConnection impl Connection {
     pub async fn query(self: MongoConnection, sql: string, params: List<DbValue>): ResultSet {
         // A connection is a single request/response channel; a second concurrent query would interleave
         // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
+        if (self.failed) { return db.errorResult(db.DbError("", self.failErr)); }
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
         let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
@@ -123,6 +138,7 @@ pub struct MongoConnection impl Connection {
     }
 
     pub async fn exec(self: MongoConnection, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(db.DbError("", self.failErr)); }
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
         let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
@@ -181,6 +197,7 @@ async fn mongoFinish(io: aio.AsyncIO, dbName: string, user: string, pass: string
         // authenticate against the auth db (the connection db here). Nonce is generated per-connection
         // from the CSPRNG (never caller-supplied / reused).
         let ok = await conn.authenticate(user, pass, random.randomHex(18));
+        if (!ok) { conn.markFailed("mongodb: authentication failed for user '" + user + "'"); }
     }
     return conn;
 }

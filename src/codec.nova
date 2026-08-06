@@ -37,6 +37,9 @@ pub fn encodeOpMsg(requestId: int, command: bson.BsonDocument): string {
 
 /// Parse the command document out of an OP_MSG reply frame.
 pub fn decodeOpMsg(frame: string): bson.BsonDocument {
+    // A truncated/closed read yields an empty frame -> return an empty doc rather than reading a
+    // length off a zero-length buffer (commandError then reports it as a failed command).
+    if (frame.length < BODY_OFFSET + 4) { return bson.BsonDocument{ entries: List<bson.BsonEntry>() }; }
     let bsonLen = bytes.read_i32(frame as ptr, BODY_OFFSET);
     let buf = bytes.alloc(bsonLen);
     let i = 0;
