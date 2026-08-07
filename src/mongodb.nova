@@ -86,6 +86,19 @@ pub struct MongoConnection impl Connection {
     // The database named in the DSN (used to connect/auth).
     pub fn defaultDatabase(self: MongoConnection): Database { return Database(self, self.dbName); }
 
+    // Start a server-assigned session (its lsid rides on every command in a transaction). Transactions
+    // require a replica set / mongos -- a standalone mongod rejects txnNumber.
+    pub async fn startSession(self: MongoConnection): Session {
+        let reply = await self.runCommand(commands.startSessionCommand());
+        let idIdx = bson.docFind(reply, "id");   // reply.id is the lsid document { id: <uuid binary> }
+        let lsid = if (idIdx >= 0) bson.docGetDoc(reply, idIdx) else "";
+        // docGetDoc returns the deserialised sub-document buffer, whose reported length can carry a couple
+        // of slack bytes past the doc's own BSON length prefix. That is harmless when the bytes are re-fed
+        // to deserialize (it honours the prefix), but here the raw bytes are embedded verbatim as `lsid`
+        // on every transaction command -- so trim to the declared BSON length or the server rejects it.
+        return Session(self, trimBsonDoc(lsid));
+    }
+
     // Send one OP_MSG command and await the reply (the recv parks the coroutine).
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
         let id = self.nextId;
@@ -183,6 +196,32 @@ pub struct MongoConnection impl Connection {
 }
 
 // Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
+// Return exactly the leading BSON document from `s`, trimming any allocator slack past the document's
+// own 4-byte little-endian length prefix. `docGetDoc` hands back a deserialised sub-document buffer whose
+// reported length can exceed the declared BSON length; re-embedding that verbatim (as an lsid) would send
+// stray trailing bytes the server rejects. If `s` is shorter than its own prefix claims, it is returned
+// unchanged (nothing safe to trim to).
+// An embedded-document (type 3) BSON entry that carries `src` as its raw bytes, built so `src` is RETAINED.
+// This is the safe way to embed the long-lived `Session.lsid` on every transaction command. `bson.entryDoc`
+// takes a `ptr` and stores `ptr as string` -- a NON-retaining view -- so when the sent command document is
+// dropped its destructor releases that view, over-releasing and freeing `self.lsid`'s buffer; the next
+// command then serialises a dangling buffer (the server reports a corrupt lsid). Storing a `string` param
+// straight into `str_val` (exactly as `bson.entryString` does) makes the struct field own a retained
+// reference, so the release on drop is balanced and `self.lsid` survives the whole transaction.
+fn lsidEntry(src: string): bson.BsonEntry {
+    return bson.BsonEntry{ type_id: 3, key: "lsid", str_val: src, int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+fn trimBsonDoc(s: string): string {
+    if (s.length < 4) { return s; }
+    let n = (s[0] & 255) | ((s[1] & 255) << 8) | ((s[2] & 255) << 16) | ((s[3] & 255) << 24);
+    if (n <= 0 || n >= s.length) { return s; }
+    let buf = bytes.alloc(n);
+    let k = 0;
+    while (k < n) { bytes.write_byte(buf, k, s[k] & 255); k = k + 1; }
+    return buf as string;
+}
+
 fn dsnParam(dsn: string, key: string, dflt: string): string {
     let needle = key + "=";
     let idx = string.indexOf(dsn, needle);
@@ -347,12 +386,30 @@ pub struct Collection {
     pub conn: MongoConnection,
     pub dbName: string,
     pub coll: string,
-    init(conn: MongoConnection, dbName: string, coll: string) { self.conn = conn; self.dbName = dbName; self.coll = coll; }
+    pub sess: Session | undefined,   // when bound, in-transaction ops carry lsid/txnNumber/autocommit
+    init(conn: MongoConnection, dbName: string, coll: string) { self.conn = conn; self.dbName = dbName; self.coll = coll; self.sess = undefined; }
+
+    // Bind a session so this collection's operations join its transaction (returns self for chaining).
+    pub fn withSession(self: Collection, s: Session): Collection { self.sess = s; return self; }
+    // Run a command, attaching the transaction context (lsid / txnNumber / autocommit / startTransaction
+    // on the first op) when this collection is bound to a session that is in a transaction.
+    async fn run(self: Collection, cmd: bson.BsonDocument): bson.BsonDocument {
+        let s = self.sess;
+        if (s != undefined) {
+            if (s.inTxn) {
+                cmd.entries.push(lsidEntry(s.lsid));
+                cmd.entries.push(bson.entryInt64Val("txnNumber", s.txnNumber));
+                cmd.entries.push(bson.entryBool("autocommit", 0));
+                if (s.firstOp) { cmd.entries.push(bson.entryBool("startTransaction", 1)); s.firstOp = false; }
+            }
+        }
+        return await self.conn.runCommand(cmd);
+    }
 
     // find with server-side filter/projection/sort/skip/limit; returns a lazy Cursor.
     pub async fn find(self: Collection, f: document.Filter, opts: document.FindOptions): Cursor {
         let cmd = commands.findCommandFull(self.dbName, self.coll, f.toBson(), opts.projection, opts.sort, opts.skip, opts.limit, opts.batchSize);
-        let reply = await self.conn.runCommand(cmd);
+        let reply = await self.run(cmd);
         let cur = Cursor(self.conn, self.dbName, self.coll);
         let e = commands.commandError(reply);
         if (!e.isEmpty()) { cur.err = e; return cur; }
@@ -397,7 +454,7 @@ pub struct Collection {
             bdocs.push(d.bson);
             i = i + 1;
         }
-        let reply = await self.conn.runCommand(commands.insertManyCommand(self.dbName, self.coll, bdocs));
+        let reply = await self.run(commands.insertManyCommand(self.dbName, self.coll, bdocs));
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.insertedCount = numAt(reply, "n");
@@ -416,7 +473,7 @@ pub struct Collection {
     }
     async fn doUpdate(self: Collection, f: document.Filter, updateBson: bson.BsonDocument, upsert: bool, multi: bool): UpdateResult {
         let res = UpdateResult();
-        let reply = await self.conn.runCommand(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi));
+        let reply = await self.run(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi));
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.matched = numAt(reply, "n");
@@ -437,7 +494,7 @@ pub struct Collection {
     pub async fn deleteMany(self: Collection, f: document.Filter): DeleteResult { return await self.doDelete(f, 0); }
     async fn doDelete(self: Collection, f: document.Filter, limit: int): DeleteResult {
         let res = DeleteResult();
-        let reply = await self.conn.runCommand(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit));
+        let reply = await self.run(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit));
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.deletedCount = numAt(reply, "n");
@@ -447,7 +504,7 @@ pub struct Collection {
     // Atomically update the first match and return the pre- or post-image (returnNew), or undefined
     // if nothing matched (and no upsert).
     pub async fn findOneAndUpdate(self: Collection, f: document.Filter, u: document.Update, returnNew: bool, upsert: bool): document.Doc | undefined {
-        let reply = await self.conn.runCommand(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert));
+        let reply = await self.run(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert));
         let vIdx = bson.docFind(reply, "value");
         if (vIdx < 0 || bson.docGetType(reply, vIdx) != 3) { return undefined; }   // absent / null (type 10)
         return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
@@ -460,7 +517,7 @@ pub struct Collection {
         let bp = List<bson.BsonDocument>();
         let i = 0;
         while (i < pipeline.size()) { bp.push((pipeline.get(i) ?? document.doc()).bson); i = i + 1; }
-        let reply = await self.conn.runCommand(commands.aggregateCommand(self.dbName, self.coll, bp, 101));
+        let reply = await self.run(commands.aggregateCommand(self.dbName, self.coll, bp, 101));
         let cur = Cursor(self.conn, self.dbName, self.coll);
         let e = commands.commandError(reply);
         if (!e.isEmpty()) { cur.err = e; return cur; }
@@ -482,13 +539,13 @@ pub struct Collection {
     }
     // Fast metadata estimate of the whole-collection count (no filter).
     pub async fn estimatedDocumentCount(self: Collection): long {
-        let reply = await self.conn.runCommand(commands.countCommand(self.dbName, self.coll, commands.newDoc()));
+        let reply = await self.run(commands.countCommand(self.dbName, self.coll, commands.newDoc()));
         return numAt(reply, "n");
     }
     // Distinct scalar values of `field` among documents matching `f`, each rendered to its string form
     // (full typed Value results are a follow-on).
     pub async fn distinct(self: Collection, field: string, f: document.Filter): List<string> {
-        let reply = await self.conn.runCommand(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
+        let reply = await self.run(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
         let out = List<string>();
         let vIdx = bson.docFind(reply, "values");
         if (vIdx < 0) { return out; }
@@ -576,4 +633,58 @@ fn valueToStr(arr: bson.BsonDocument, i: int): string {
     if (t == 8) { return if (bson.docGetBool(arr, i) != 0) "true" else "false"; }
     if (t == 7) { return bson.docGetObjectId(arr, i); }
     return "";
+}
+
+// --- Session + multi-document transactions (P5) --------------------------------------------------
+
+// A client session. Its server-assigned lsid rides on every command in a transaction; txnNumber
+// identifies the transaction. Transactions require a replica set / mongos.
+pub struct Session {
+    pub conn: MongoConnection,
+    pub lsid: string,        // raw serialized { id: <uuid binary> } sub-document bytes (from startSession)
+    pub txnNumber: long,
+    pub inTxn: bool,
+    pub firstOp: bool,       // the first op of a transaction carries startTransaction: true
+    init(conn: MongoConnection, lsid: string) {
+        self.conn = conn; self.lsid = lsid; self.txnNumber = 0; self.inTxn = false; self.firstOp = false;
+    }
+    // Begin a transaction: bump the txnNumber and arm the startTransaction flag for the next op.
+    pub fn startTransaction(self: Session): void {
+        self.txnNumber = self.txnNumber + 1;
+        self.inTxn = true;
+        self.firstOp = true;
+    }
+    // A collection whose operations join this session's transaction.
+    pub fn collection(self: Session, dbName: string, coll: string): Collection {
+        return Collection(self.conn, dbName, coll).withSession(self);
+    }
+    // NOTE: the lsid document is built INLINE here (not via commands.commitTxnCommand) on purpose. Passing
+    // the raw lsid bytes through a `lsid: string` parameter and then `bson.entryDoc(_, ptr)` launders away
+    // ARC ownership of the buffer (entryDoc stores `ptr as string`, an alias), so the aliased bytes can be
+    // reused before the command is serialised -> the server sees a corrupt lsid. Referencing `self.lsid`
+    // inline keeps the buffer owned by the live Session across runCommand, exactly like Collection.run does.
+    pub async fn commitTransaction(self: Session): DbError {
+        if (!self.inTxn) { return db.noError(); }
+        let cmd = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        cmd.entries.push(bson.entryInt("commitTransaction", 1));
+        cmd.entries.push(lsidEntry(self.lsid));
+        cmd.entries.push(bson.entryInt64Val("txnNumber", self.txnNumber));
+        cmd.entries.push(bson.entryBool("autocommit", 0));
+        cmd.entries.push(bson.entryString("$db", "admin"));
+        let reply = await self.conn.runCommand(cmd);
+        self.inTxn = false;
+        return commands.commandError(reply);
+    }
+    pub async fn abortTransaction(self: Session): DbError {
+        if (!self.inTxn) { return db.noError(); }
+        let cmd = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        cmd.entries.push(bson.entryInt("abortTransaction", 1));
+        cmd.entries.push(lsidEntry(self.lsid));
+        cmd.entries.push(bson.entryInt64Val("txnNumber", self.txnNumber));
+        cmd.entries.push(bson.entryBool("autocommit", 0));
+        cmd.entries.push(bson.entryString("$db", "admin"));
+        let reply = await self.conn.runCommand(cmd);
+        self.inTxn = false;
+        return commands.commandError(reply);
+    }
 }

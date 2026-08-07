@@ -202,6 +202,35 @@ pub fn dropIndexCommand(dbName: string, coll: string, name: string): bson.BsonDo
     return d;
 }
 
+/// { startSession: 1, $db: "admin" } — the server returns { id: { id: <uuid binary> } }.
+pub fn startSessionCommand(): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("startSession", 1));
+    d.entries.push(bson.entryString("$db", "admin"));
+    return d;
+}
+/// { commitTransaction: 1, lsid, txnNumber, autocommit: false, $db: "admin" }. `lsid` is the raw
+/// serialized `{ id: <binary> }` sub-document bytes returned by startSession.
+pub fn commitTxnCommand(lsid: string, txnNumber: long): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("commitTransaction", 1));
+    d.entries.push(bson.entryDoc("lsid", lsid));
+    d.entries.push(bson.entryInt64Val("txnNumber", txnNumber));
+    d.entries.push(bson.entryBool("autocommit", 0));
+    d.entries.push(bson.entryString("$db", "admin"));
+    return d;
+}
+/// { abortTransaction: 1, lsid, txnNumber, autocommit: false, $db: "admin" }.
+pub fn abortTxnCommand(lsid: string, txnNumber: long): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("abortTransaction", 1));
+    d.entries.push(bson.entryDoc("lsid", lsid));
+    d.entries.push(bson.entryInt64Val("txnNumber", txnNumber));
+    d.entries.push(bson.entryBool("autocommit", 0));
+    d.entries.push(bson.entryString("$db", "admin"));
+    return d;
+}
+
 // Map a MongoDB error code onto the normalized db.DBERR_* taxonomy.
 pub fn classifyMongoErr(code: int): int {
     if (code == 11000 || code == 11001) { return db.DBERR_UNIQUE_VIOLATION; }  // duplicate key
