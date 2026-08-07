@@ -82,6 +82,8 @@ pub struct MongoConnection impl Connection {
     pub dsn: string,             // the connection string, kept so a heartbeat can re-run discovery
     pub serverType: string,      // RSPrimary / RSSecondary / RSOther / Standalone / Unknown
     pub wantsPrimary: bool,      // read preference is primary(-preferred): a heartbeat must stay on the primary
+    pub monitorRunning: bool,    // a background heartbeat loop is active
+    pub heartbeatCount: long,    // number of background heartbeats completed (observability)
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
@@ -99,6 +101,26 @@ pub struct MongoConnection impl Connection {
         self.dsn = "";
         self.serverType = "Unknown";
         self.wantsPrimary = true;
+        self.monitorRunning = false;
+        self.heartbeatCount = 0;
+    }
+    // Background SDAM monitor: a detached coroutine that heartbeats this connection every `intervalMs`,
+    // keeping serverType / members fresh and auto-healing on a failover WITHOUT any caller action. Use a
+    // connection DEDICATED to monitoring (the loop shares its socket, so do not run data ops on it too).
+    // Built on aio.delay (a real reactor-timer sleep) + coroStart (a detached coroutine) -- reactor-thread
+    // only. stopMonitor() ends the loop after the current beat.
+    pub fn startMonitor(self: MongoConnection, intervalMs: int): void {
+        if (self.monitorRunning) { return; }
+        self.monitorRunning = true;
+        coroStart(self.monitorLoop(intervalMs));
+    }
+    pub fn stopMonitor(self: MongoConnection): void { self.monitorRunning = false; }
+    async fn monitorLoop(self: MongoConnection, intervalMs: int): void {
+        while (self.monitorRunning) {
+            let _ = await self.heartbeat();
+            self.heartbeatCount = self.heartbeatCount + 1;
+            await aio.delay(intervalMs);
+        }
     }
     // SDAM: re-run discovery from the stored DSN and swap this connection over to the (possibly new)
     // read-preference target -- the on-demand half of server monitoring, used when a heartbeat finds the
