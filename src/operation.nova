@@ -261,6 +261,18 @@ pub fn writeError(reply: bson.BsonDocument): DbError {
     return DbError(`${code}`, msg).with(code, classifyMongoErr(code));
 }
 
+/// { authenticate: 1, mechanism: "MONGODB-X509", user?: <subject DN>, $db: "$external" } -- X.509 auth.
+/// The client certificate presented during the TLS handshake IS the credential; `user` is optional (the
+/// server derives the identity from the cert subject when it is omitted).
+pub fn authenticateX509Command(user: string): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt("authenticate", 1));
+    d.entries.push(bson.entryString("mechanism", "MONGODB-X509"));
+    if (user != "") { d.entries.push(bson.entryString("user", user)); }
+    d.entries.push(bson.entryString("$db", "$external"));
+    return d;
+}
+
 /// { saslStart: 1, mechanism: "SCRAM-SHA-256", payload: <bin>, $db: <db> }.
 pub fn saslStartCommand(dbName: string, clientFirst: string): bson.BsonDocument {
     let d = newDoc();
