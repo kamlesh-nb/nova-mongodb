@@ -1199,6 +1199,8 @@ pub fn bindAll<T>(docs: List<document.Doc>): List<T> {
 }
 pub fn findOptions(): document.FindOptions { return document.findOptions(); }
 pub fn update(): document.Update { return document.update(); }
+// An empty pipeline (a List<Doc>), so consumers building an aggregate / change stream need not import list.
+pub fn docList(): List<document.Doc> { return List<document.Doc>(); }
 
 // --- write results + helpers (P3) ---------------------------------------------------------------
 
