@@ -149,6 +149,59 @@ pub fn findAndModifyCommand(dbName: string, coll: string, filter: bson.BsonDocum
     return d;
 }
 
+/// { aggregate: <coll>, pipeline: [<stage>...], cursor: { batchSize }, $db }.
+pub fn aggregateCommand(dbName: string, coll: string, pipeline: List<bson.BsonDocument>, batchSize: int): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("aggregate", coll));
+    d.entries.push(bson.entryArray("pipeline", docArray(pipeline)));
+    let cur = newDoc();
+    cur.entries.push(bson.entryInt("batchSize", batchSize));
+    d.entries.push(bson.entryDoc("cursor", bson.serialize(cur)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { count: <coll>, query: <filter>, $db } — a fast metadata count (query omitted = whole collection).
+pub fn countCommand(dbName: string, coll: string, filter: bson.BsonDocument): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("count", coll));
+    if (filter.entries.size() > 0) { d.entries.push(bson.entryDoc("query", bson.serialize(filter))); }
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { distinct: <coll>, key: <field>, query: <filter>, $db }.
+pub fn distinctCommand(dbName: string, coll: string, key: string, filter: bson.BsonDocument): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("distinct", coll));
+    d.entries.push(bson.entryString("key", key));
+    if (filter.entries.size() > 0) { d.entries.push(bson.entryDoc("query", bson.serialize(filter))); }
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { createIndexes: <coll>, indexes: [{ key, name, unique? }], $db }.
+pub fn createIndexCommand(dbName: string, coll: string, keys: bson.BsonDocument, name: string, unique: bool): bson.BsonDocument {
+    let idx = newDoc();
+    idx.entries.push(bson.entryDoc("key", bson.serialize(keys)));
+    idx.entries.push(bson.entryString("name", name));
+    if (unique) { idx.entries.push(bson.entryBool("unique", 1)); }
+    let d = newDoc();
+    d.entries.push(bson.entryString("createIndexes", coll));
+    d.entries.push(bson.entryArray("indexes", oneDocArray(idx)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { dropIndexes: <coll>, index: <name>, $db }.
+pub fn dropIndexCommand(dbName: string, coll: string, name: string): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("dropIndexes", coll));
+    d.entries.push(bson.entryString("index", name));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
 // Map a MongoDB error code onto the normalized db.DBERR_* taxonomy.
 pub fn classifyMongoErr(code: int): int {
     if (code == 11000 || code == 11001) { return db.DBERR_UNIQUE_VIOLATION; }  // duplicate key

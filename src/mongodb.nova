@@ -452,6 +452,60 @@ pub struct Collection {
         if (vIdx < 0 || bson.docGetType(reply, vIdx) != 3) { return undefined; }   // absent / null (type 10)
         return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
     }
+
+    // -- aggregation / count / distinct / indexes (P4) --
+
+    // Run an aggregation pipeline (a list of stage documents) and return a lazy Cursor over the result.
+    pub async fn aggregate(self: Collection, pipeline: List<document.Doc>): Cursor {
+        let bp = List<bson.BsonDocument>();
+        let i = 0;
+        while (i < pipeline.size()) { bp.push((pipeline.get(i) ?? document.doc()).bson); i = i + 1; }
+        let reply = await self.conn.runCommand(commands.aggregateCommand(self.dbName, self.coll, bp, 101));
+        let cur = Cursor(self.conn, self.dbName, self.coll);
+        let e = commands.commandError(reply);
+        if (!e.isEmpty()) { cur.err = e; return cur; }
+        let page = readCursorReply(reply, "firstBatch");
+        cur.cursorId = page.cursorId;
+        cur.batch = page.docs;
+        return cur;
+    }
+    // Exact count of documents matching `f`, via aggregate [{$match}, {$count}].
+    pub async fn countDocuments(self: Collection, f: document.Filter): long {
+        let pipe = List<document.Doc>();
+        let _ = pipe.push(document.doc().setDoc("$match", document.wrapDoc(f.toBson())));
+        let _2 = pipe.push(document.doc().setStr("$count", "n"));
+        let cur = await self.aggregate(pipe);
+        let d = await cur.next();
+        let _3 = await cur.close();
+        if (d == undefined) { return 0; }
+        return d.getInt("n") ?? (0 as long);
+    }
+    // Fast metadata estimate of the whole-collection count (no filter).
+    pub async fn estimatedDocumentCount(self: Collection): long {
+        let reply = await self.conn.runCommand(commands.countCommand(self.dbName, self.coll, commands.newDoc()));
+        return numAt(reply, "n");
+    }
+    // Distinct scalar values of `field` among documents matching `f`, each rendered to its string form
+    // (full typed Value results are a follow-on).
+    pub async fn distinct(self: Collection, field: string, f: document.Filter): List<string> {
+        let reply = await self.conn.runCommand(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
+        let out = List<string>();
+        let vIdx = bson.docFind(reply, "values");
+        if (vIdx < 0) { return out; }
+        let arr = bson.deserialize(bson.docGetArray(reply, vIdx) as ptr);
+        let i = 0;
+        while (i < arr.entries.size()) { out.push(valueToStr(arr, i)); i = i + 1; }
+        return out;
+    }
+    // Create an index over `keys` (e.g. doc().setInt("age", 1)); returns the (classified) DbError, empty on success.
+    pub async fn createIndex(self: Collection, keys: document.Doc, name: string, unique: bool): DbError {
+        let reply = await self.conn.runCommand(commands.createIndexCommand(self.dbName, self.coll, keys.bson, name, unique));
+        return commands.commandError(reply);
+    }
+    pub async fn dropIndex(self: Collection, name: string): DbError {
+        let reply = await self.conn.runCommand(commands.dropIndexCommand(self.dbName, self.coll, name));
+        return commands.commandError(reply);
+    }
 }
 
 pub struct Database {
@@ -510,4 +564,16 @@ fn numAt(reply: bson.BsonDocument, key: string): long {
     if (t == 16 || t == 18) { return bson.docGetInt64(reply, i); }
     if (t == 1) { return bson.docGetDouble(reply, i) as long; }
     return 0;
+}
+
+// Render a scalar BSON value (at index i of an array document) to its string form -- for distinct().
+// A full typed Value union is a follow-on; this covers string/int/double/bool/objectId.
+fn valueToStr(arr: bson.BsonDocument, i: int): string {
+    let t = bson.docGetType(arr, i);
+    if (t == 2) { return bson.docGetString(arr, i); }
+    if (t == 16 || t == 18) { return `${bson.docGetInt64(arr, i)}`; }
+    if (t == 1) { return `${bson.docGetDouble(arr, i)}`; }
+    if (t == 8) { return if (bson.docGetBool(arr, i) != 0) "true" else "false"; }
+    if (t == 7) { return bson.docGetObjectId(arr, i); }
+    return "";
 }
