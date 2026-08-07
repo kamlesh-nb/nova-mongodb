@@ -109,6 +109,34 @@ pub fn insertManyCommand(dbName: string, coll: string, docs: List<bson.BsonDocum
     return d;
 }
 
+/// bulkWrite building blocks (a single command carrying MANY specs). `insertManyCommandOrdered` is
+/// insertManyCommand with an explicit ordered flag; the bulk update/delete commands take an array of
+/// pre-built specs ({ q, u, upsert, multi } / { q, limit }).
+pub fn insertManyCommandOrdered(dbName: string, coll: string, docs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("insert", coll));
+    d.entries.push(bson.entryArray("documents", docArray(docs)));
+    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+pub fn bulkUpdateCommand(dbName: string, coll: string, specs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("update", coll));
+    d.entries.push(bson.entryArray("updates", docArray(specs)));
+    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+pub fn bulkDeleteCommand(dbName: string, coll: string, specs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("delete", coll));
+    d.entries.push(bson.entryArray("deletes", docArray(specs)));
+    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
 /// { update: <coll>, updates: [{ q, u, upsert, multi }], $db }.
 pub fn updateCommand(dbName: string, coll: string, filter: bson.BsonDocument, updateDoc: bson.BsonDocument,
                      upsert: bool, multi: bool): bson.BsonDocument {

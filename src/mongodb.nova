@@ -589,7 +589,7 @@ pub struct Collection {
     // an implicit-session lsid + a fresh txnNumber are attached and the write is retried ONCE on a
     // retryable error; the same txnNumber makes the retry idempotent (the server dedups). A standalone
     // (setName == "") or a disabled/ineligible write falls back to a plain, un-tagged send.
-    async fn runWrite(self: Collection, cmd: bson.BsonDocument, retryable: bool): bson.BsonDocument {
+    pub async fn runWrite(self: Collection, cmd: bson.BsonDocument, retryable: bool): bson.BsonDocument {
         let s = self.sess;
         if (s != undefined) {
             if (s.inTxn) { return await self.run(cmd); }
@@ -715,6 +715,9 @@ pub struct Collection {
         return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
     }
 
+    // Start a bulk write: a mix of insert/update/delete queued on a builder and sent in grouped batches.
+    pub fn bulk(self: Collection): BulkWrite { return BulkWrite(self); }
+
     // -- aggregation / count / distinct / indexes (P4) --
 
     // Run an aggregation pipeline (a list of stage documents) and return a lazy Cursor over the result.
@@ -817,6 +820,124 @@ pub struct DeleteResult {
 // Generate a fresh 24-hex ObjectId (12 CSPRNG bytes -- valid + unique; the spec's time+counter layout
 // is not required for uniqueness).
 pub fn newObjectId(): string { return random.randomHex(12); }
+
+// --- bulk write: a typed WriteOp queue executed in grouped batches -------------------------------
+
+pub const BULK_INSERT: int = 0;
+pub const BULK_UPDATE: int = 1;   // updateOne / updateMany / replaceOne all lower to an update spec
+pub const BULK_DELETE: int = 2;
+
+// One queued operation. `spec` is the insert document (BULK_INSERT) or the pre-built update/delete spec
+// ({ q, u, upsert, multi } / { q, limit }).
+pub struct WriteOp {
+    pub kind: int,
+    pub spec: bson.BsonDocument,
+    init(kind: int, spec: bson.BsonDocument) { self.kind = kind; self.spec = spec; }
+}
+
+pub struct BulkResult {
+    pub insertedCount: long,
+    pub matchedCount: long,
+    pub modifiedCount: long,
+    pub deletedCount: long,
+    pub upsertedCount: long,
+    pub err: DbError,
+    init() {
+        self.insertedCount = 0; self.matchedCount = 0; self.modifiedCount = 0;
+        self.deletedCount = 0; self.upsertedCount = 0; self.err = db.noError();
+    }
+    pub fn ok(self: BulkResult): bool { return self.err.isEmpty(); }
+}
+
+// An update spec { q, u, upsert, multi } for the bulk update command.
+fn updateSpec(filter: bson.BsonDocument, updateDoc: bson.BsonDocument, upsert: bool, multi: bool): bson.BsonDocument {
+    let u = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    u.entries.push(bson.entryDoc("q", bson.serialize(filter)));
+    u.entries.push(bson.entryDoc("u", bson.serialize(updateDoc)));
+    u.entries.push(bson.entryBool("upsert", if (upsert) 1 else 0));
+    u.entries.push(bson.entryBool("multi", if (multi) 1 else 0));
+    return u;
+}
+// A delete spec { q, limit } for the bulk delete command.
+fn deleteSpec(filter: bson.BsonDocument, limit: int): bson.BsonDocument {
+    let del = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    del.entries.push(bson.entryDoc("q", bson.serialize(filter)));
+    del.entries.push(bson.entryInt("limit", limit));
+    return del;
+}
+// Number of elements in a reply's array field (0 if absent) -- used to count upserts.
+fn arraySize(reply: bson.BsonDocument, key: string): long {
+    let i = bson.docFind(reply, key);
+    if (i < 0 || bson.docGetType(reply, i) != 4) { return 0; }
+    return bson.deserialize(bson.docGetArray(reply, i) as ptr).entries.size() as long;
+}
+
+// A fluent bulk-write builder. Queue insert/update/delete ops, then execute(ordered). Consecutive ops of
+// the same kind are grouped into one insert/update/delete command (fewer round trips). For ordered the
+// first failing batch stops the run; for unordered every batch is attempted. Not atomic (bulkWrite never
+// is) -- wrap it in a session transaction for atomicity.
+pub struct BulkWrite {
+    pub coll: Collection,
+    pub ops: List<WriteOp>,
+    init(coll: Collection) { self.coll = coll; self.ops = List<WriteOp>(); }
+
+    pub fn insertOne(self: BulkWrite, d: document.Doc): BulkWrite {
+        if (!d.has("_id")) { let _ = d.setObjectId("_id", newObjectId()); }
+        self.ops.push(WriteOp(BULK_INSERT, d.bson));
+        return self;
+    }
+    pub fn updateOne(self: BulkWrite, f: document.Filter, u: document.Update, upsert: bool): BulkWrite {
+        self.ops.push(WriteOp(BULK_UPDATE, updateSpec(f.toBson(), u.toBson(), upsert, false))); return self;
+    }
+    pub fn updateMany(self: BulkWrite, f: document.Filter, u: document.Update): BulkWrite {
+        self.ops.push(WriteOp(BULK_UPDATE, updateSpec(f.toBson(), u.toBson(), false, true))); return self;
+    }
+    pub fn replaceOne(self: BulkWrite, f: document.Filter, replacement: document.Doc, upsert: bool): BulkWrite {
+        self.ops.push(WriteOp(BULK_UPDATE, updateSpec(f.toBson(), replacement.bson, upsert, false))); return self;
+    }
+    pub fn deleteOne(self: BulkWrite, f: document.Filter): BulkWrite {
+        self.ops.push(WriteOp(BULK_DELETE, deleteSpec(f.toBson(), 1))); return self;
+    }
+    pub fn deleteMany(self: BulkWrite, f: document.Filter): BulkWrite {
+        self.ops.push(WriteOp(BULK_DELETE, deleteSpec(f.toBson(), 0))); return self;
+    }
+
+    pub async fn execute(self: BulkWrite, ordered: bool): BulkResult {
+        let res = BulkResult();
+        let i = 0;
+        while (i < self.ops.size()) {
+            let kind = (self.ops.get(i) ?? WriteOp(BULK_INSERT, commands.newDoc())).kind;
+            let batch = List<bson.BsonDocument>();
+            while (i < self.ops.size()) {
+                let op = self.ops.get(i) ?? WriteOp(BULK_INSERT, commands.newDoc());
+                if (op.kind != kind) { break; }
+                batch.push(op.spec);
+                i = i + 1;
+            }
+            let reply = commands.newDoc();
+            if (kind == BULK_INSERT) {
+                reply = await self.coll.runWrite(commands.insertManyCommandOrdered(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                res.insertedCount = res.insertedCount + numAt(reply, "n");
+            } else {
+                if (kind == BULK_UPDATE) {
+                    reply = await self.coll.runWrite(commands.bulkUpdateCommand(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                    res.matchedCount = res.matchedCount + numAt(reply, "n");
+                    res.modifiedCount = res.modifiedCount + numAt(reply, "nModified");
+                    res.upsertedCount = res.upsertedCount + arraySize(reply, "upserted");
+                } else {
+                    reply = await self.coll.runWrite(commands.bulkDeleteCommand(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                    res.deletedCount = res.deletedCount + numAt(reply, "n");
+                }
+            }
+            let e = commands.writeError(reply);
+            if (!e.isEmpty()) {
+                res.err = e;
+                if (ordered) { return res; }
+            }
+        }
+        return res;
+    }
+}
 
 // Read a numeric reply field (n / nModified) whether the server encoded it as int32, int64 or double.
 fn numAt(reply: bson.BsonDocument, key: string): long {
