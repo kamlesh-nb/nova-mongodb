@@ -1,0 +1,172 @@
+// gridfs — a GridFS bucket for storing large files, split across two collections: <bucket>.files
+// (one metadata document per file) and <bucket>.chunks (the file's bytes in fixed-size pieces). SRP:
+// chunked large-file storage on top of the document API; it holds no wire/BSON logic of its own, only
+// two Collections. Mirrors the Go driver's separate `gridfs` package, so consumers do
+// `import mongodb; import gridfs;` and open a bucket with `gridfs.bucket(conn, db, "fs")`.
+import list;
+import string;
+import serde.bson;
+import datetime;
+import db;
+import mongodb;
+import document;
+
+// The GridFS default chunk size (255 KiB). Each chunk document holds at most this many bytes.
+pub const DEFAULT_CHUNK_SIZE: int = 261120;
+
+// One file's metadata (the <bucket>.files document), decoded into a typed struct.
+pub struct GridFSFile {
+    pub id: string,          // hex ObjectId of the files document (its _id)
+    pub filename: string,
+    pub length: long,        // total byte length of the file
+    pub chunkSize: int,      // the chunk size this file was stored with
+    pub uploadDate: long,    // milliseconds since the Unix epoch
+    init() { self.id = ""; self.filename = ""; self.length = 0; self.chunkSize = 0; self.uploadDate = 0; }
+}
+
+// Result of an upload: the new file's hex _id, or a classified error.
+pub struct UploadResult {
+    pub id: string,          // "" on failure
+    pub err: DbError,
+    init() { self.id = ""; self.err = db.noError(); }
+    pub fn ok(self: UploadResult): bool { return self.err.isEmpty(); }
+}
+
+// Result of a download: the reassembled bytes, whether the file existed, and any error.
+pub struct DownloadResult {
+    pub data: string,        // the file's bytes (a binary-carrying string); "" for a missing or empty file
+    pub found: bool,
+    pub err: DbError,
+    init() { self.data = ""; self.found = false; self.err = db.noError(); }
+    pub fn ok(self: DownloadResult): bool { return self.err.isEmpty() && self.found; }
+}
+
+// A GridFS bucket over a database. `files` and `chunks` are ordinary collections, so everything the
+// document API offers (indexes, cursors, transactions) works on them directly.
+pub struct Bucket {
+    pub conn: mongodb.MongoConnection,
+    pub dbName: string,
+    pub name: string,
+    pub chunkSize: int,
+    pub files: mongodb.Collection,
+    pub chunks: mongodb.Collection,
+    init(conn: mongodb.MongoConnection, dbName: string, name: string) {
+        self.conn = conn; self.dbName = dbName; self.name = name;
+        self.chunkSize = DEFAULT_CHUNK_SIZE;
+        self.files = mongodb.Collection(conn, dbName, name + ".files");
+        self.chunks = mongodb.Collection(conn, dbName, name + ".chunks");
+    }
+    // Override the chunk size for subsequent uploads (returns self for chaining). Ignored if <= 0.
+    pub fn withChunkSize(self: Bucket, n: int): Bucket { if (n > 0) { self.chunkSize = n; } return self; }
+
+    // Create the standard GridFS indexes (idempotent): chunks unique on {files_id, n}, files on
+    // {filename, uploadDate}. Call once when provisioning a bucket.
+    pub async fn ensureIndexes(self: Bucket): DbError {
+        let e1 = await self.chunks.createIndex(mongodb.doc().setInt("files_id", 1).setInt("n", 1), "files_id_1_n_1", true);
+        if (!e1.isEmpty()) { return e1; }
+        return await self.files.createIndex(mongodb.doc().setInt("filename", 1).setInt("uploadDate", 1), "filename_1_uploadDate_1", false);
+    }
+
+    // Upload `data` (raw bytes carried in a string) under `filename`. Streams the chunk documents in
+    // order, then writes the files document last (so a partially-written file has no files entry and is
+    // simply ignored). Returns the new file's hex _id.
+    pub async fn upload(self: Bucket, filename: string, data: string): UploadResult {
+        let res = UploadResult();
+        let filesId = mongodb.newObjectId();
+        let total = data.length;
+        let n = 0;
+        let off = 0;
+        while (off < total) {
+            let end = if (total - off < self.chunkSize) total else off + self.chunkSize;
+            let part = string.slice(data, off, end);
+            let cd = mongodb.doc().setObjectId("files_id", filesId).setInt("n", n as long).setBinary("data", part);
+            let r = await self.chunks.insertOne(cd);
+            if (!r.ok()) { res.err = r.err; return res; }
+            off = end;
+            n = n + 1;
+        }
+        let uploadMs = datetime.nowNs() / 1000000;
+        let fd = mongodb.doc()
+            .setObjectId("_id", filesId)
+            .setInt("length", total as long)
+            .setInt("chunkSize", self.chunkSize as long)
+            .setDate("uploadDate", uploadMs)
+            .setStr("filename", filename);
+        let fr = await self.files.insertOne(fd);
+        if (!fr.ok()) { res.err = fr.err; return res; }
+        res.id = filesId;
+        return res;
+    }
+
+    // Download the file with hex _id `filesId`, reassembling its chunks in `n` order. `found` is false if
+    // no such files document exists.
+    pub async fn download(self: Bucket, filesId: string): DownloadResult {
+        let res = DownloadResult();
+        let fdoc = await self.files.findOne(mongodb.filter().eqObjectId("_id", filesId));
+        if (fdoc == undefined) { return res; }
+        res.found = true;
+        let cur = await self.chunks.find(mongodb.filter().eqObjectId("files_id", filesId), mongodb.findOptions().sortAsc("n"));
+        let out = "";
+        while (true) {
+            let ch = await cur.next();
+            if (ch == undefined) { break; }
+            let part = ch.getBinary("data");
+            if (part != undefined) { out = out + part; }
+        }
+        let _ = await cur.close();
+        res.data = out;
+        return res;
+    }
+
+    // The newest file stored under `filename` (GridFS permits duplicate filenames; the latest upload
+    // wins), or undefined when there is none.
+    pub async fn findByName(self: Bucket, filename: string): GridFSFile | undefined {
+        let cur = await self.files.find(mongodb.filter().eqStr("filename", filename), mongodb.findOptions().sortDesc("uploadDate").withLimit(1));
+        let d = await cur.next();
+        let _ = await cur.close();
+        if (d == undefined) { return undefined; }
+        return fileFromDoc(d);
+    }
+
+    // Download the newest file stored under `filename`.
+    pub async fn downloadByName(self: Bucket, filename: string): DownloadResult {
+        let f = await self.findByName(filename);
+        if (f == undefined) { return DownloadResult(); }
+        return await self.download(f.id);
+    }
+
+    // Delete a file: remove all its chunks, then its files document. Returns the files-delete error.
+    pub async fn delete(self: Bucket, filesId: string): DbError {
+        let _ = await self.chunks.deleteMany(mongodb.filter().eqObjectId("files_id", filesId));
+        let fr = await self.files.deleteOne(mongodb.filter().eqObjectId("_id", filesId));
+        return fr.err;
+    }
+
+    // All files in the bucket, sorted by filename.
+    pub async fn listFiles(self: Bucket): List<GridFSFile> {
+        let out = list.List<GridFSFile>();
+        let cur = await self.files.find(mongodb.all(), mongodb.findOptions().sortAsc("filename"));
+        while (true) {
+            let d = await cur.next();
+            if (d == undefined) { break; }
+            let f = fileFromDoc(d);
+            if (f != undefined) { out.push(f); }
+        }
+        let _ = await cur.close();
+        return out;
+    }
+}
+
+// Decode a <bucket>.files document into a typed GridFSFile.
+fn fileFromDoc(d: document.Doc): GridFSFile | undefined {
+    let f = GridFSFile();
+    f.id = d.getObjectId("_id") ?? "";
+    f.filename = d.getStr("filename") ?? "";
+    f.length = d.getInt("length") ?? 0;
+    f.chunkSize = (d.getInt("chunkSize") ?? 0) as int;
+    f.uploadDate = d.getDate("uploadDate") ?? 0;
+    return f;
+}
+
+// Open a GridFS bucket (typically named "fs") on a live connection.
+pub fn bucket(conn: mongodb.MongoConnection, dbName: string, name: string): Bucket { return Bucket(conn, dbName, name); }
