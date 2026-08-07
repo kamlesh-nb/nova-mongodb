@@ -4,8 +4,9 @@
 // + the connect/handshake/auth orchestration. Every other responsibility lives in its own
 // module (SOLID/SRP):
 //
-//   codec     the OP_MSG wire codec        (encodeOpMsg / decodeOpMsg / frameLength)
-//   commands  BSON command builders        (hello/insert/find/saslStart/... + commandError)
+//   wiremessage  the OP_MSG wire codec      (encodeOpMsg / encodeOpMsgSeq / decodeOpMsg / frameLength)
+//   operation    BSON command builders      (hello/insert/find/saslStart/... + commandError)
+//   dns          mongodb+srv:// SRV/TXT resolver
 //
 // Consumers only touch MongoDriver/MongoConnection: `import mongodb; MongoDriver()`.
 // It depends only on the Nova standard library (the DB seam + BSON + SCRAM crypto) and is
@@ -23,10 +24,10 @@ import net.aio;
 import net.asynctls;
 import io.file;
 import db;
-import codec;
-import commands;
+import wiremessage;
+import operation;
 import document;
-import srv;
+import dns;
 
 // ---------------------------------------------------------------------------
 // Live socket framing
@@ -49,17 +50,17 @@ async fn readExact(io: aio.AsyncIO, n: int): string {
 // Read a full OP_MSG frame (16-byte header carries messageLength, then the rest). Parks.
 // Returns "" if the connection closes mid-frame or the declared length is out of bounds.
 async fn readFrame(io: aio.AsyncIO): string {
-    let head = await readExact(io, codec.HEADER_LEN);
-    if (head.length < codec.HEADER_LEN) { return ""; }               // closed before a full header
+    let head = await readExact(io, wiremessage.HEADER_LEN);
+    if (head.length < wiremessage.HEADER_LEN) { return ""; }               // closed before a full header
     let total = bytes.read_i32(head as ptr, 0);
-    if (total < codec.HEADER_LEN || total > 67108864) { return ""; } // bound the alloc (64 MiB ceiling)
-    let rest = await readExact(io, total - codec.HEADER_LEN);
-    if (total > codec.HEADER_LEN && rest.length < total - codec.HEADER_LEN) { return ""; }  // truncated body
+    if (total < wiremessage.HEADER_LEN || total > 67108864) { return ""; } // bound the alloc (64 MiB ceiling)
+    let rest = await readExact(io, total - wiremessage.HEADER_LEN);
+    if (total > wiremessage.HEADER_LEN && rest.length < total - wiremessage.HEADER_LEN) { return ""; }  // truncated body
     let full = bytes.alloc(total);
     let i = 0;
-    while (i < codec.HEADER_LEN) { bytes.write_byte(full, i, bytes.read_byte(head, i)); i = i + 1; }
+    while (i < wiremessage.HEADER_LEN) { bytes.write_byte(full, i, bytes.read_byte(head, i)); i = i + 1; }
     let j = 0;
-    while (j < total - codec.HEADER_LEN) { bytes.write_byte(full, codec.HEADER_LEN + j, bytes.read_byte(rest, j)); j = j + 1; }
+    while (j < total - wiremessage.HEADER_LEN) { bytes.write_byte(full, wiremessage.HEADER_LEN + j, bytes.read_byte(rest, j)); j = j + 1; }
     return full as string;
 }
 
@@ -145,7 +146,7 @@ pub struct MongoConnection impl Connection {
     // per-check step of server monitoring; a background timer that calls it on an interval is a follow-on
     // (Nova has no async sleep primitive yet).
     pub async fn heartbeat(self: MongoConnection): bool {
-        let info = parseHello(await self.runCommand(commands.helloCommand(self.dbName)));
+        let info = parseHello(await self.runCommand(operation.helloCommand(self.dbName)));
         if (!info.ok) { return await self.reconnect(); }   // unreachable -> try to re-discover
         self.setName = info.setName;
         self.members = info.hosts;
@@ -166,7 +167,7 @@ pub struct MongoConnection impl Connection {
     // server-assigned lsid, trimmed to its declared BSON length (see trimBsonDoc / lsidEntry).
     async fn ensureImplicitSession(self: MongoConnection): void {
         if (self.implicitLsid != "") { return; }
-        let reply = await self.runCommand(commands.startSessionCommand());
+        let reply = await self.runCommand(operation.startSessionCommand());
         let idIdx = bson.docFind(reply, "id");
         if (idIdx >= 0) { self.implicitLsid = trimBsonDoc(bson.docGetDoc(reply, idIdx)); }
     }
@@ -183,21 +184,21 @@ pub struct MongoConnection impl Connection {
         if (!await self.reconnect()) { return reply; }   // no new primary yet -> surface the original error
         return await self.runCommand(command);            // retry once on the new primary
     }
-    // Send a command whose bulk payload rides in a KIND-1 OP_MSG document sequence (codec.encodeOpMsgSeq)
+    // Send a command whose bulk payload rides in a KIND-1 OP_MSG document sequence (wiremessage.encodeOpMsgSeq)
     // rather than an array in the body -- the wire-efficient form for bulk writes. Same failed-guard as
     // runCommand.
     pub async fn runCommandSeq(self: MongoConnection, command: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
         if (self.failed) {
-            let e = commands.newDoc();
+            let e = operation.newDoc();
             e.entries.push(bson.entryDouble("ok", 0, 0));
             e.entries.push(bson.entryString("errmsg", self.failErr));
             return e;
         }
         let id = self.nextId;
         self.nextId = id + 1;
-        let frame = codec.encodeOpMsgSeq(id, command, seqId, docs);
+        let frame = wiremessage.encodeOpMsgSeq(id, command, seqId, docs);
         let dummy = await self.io.sendStr(frame);
-        return codec.decodeOpMsg(await readFrame(self.io));
+        return wiremessage.decodeOpMsg(await readFrame(self.io));
     }
     pub async fn runCommandSeqFailover(self: MongoConnection, command: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
         let reply = await self.runCommandSeq(command, seqId, docs);
@@ -222,7 +223,7 @@ pub struct MongoConnection impl Connection {
     // Start a server-assigned session (its lsid rides on every command in a transaction). Transactions
     // require a replica set / mongos -- a standalone mongod rejects txnNumber.
     pub async fn startSession(self: MongoConnection): Session {
-        let reply = await self.runCommand(commands.startSessionCommand());
+        let reply = await self.runCommand(operation.startSessionCommand());
         let idIdx = bson.docFind(reply, "id");   // reply.id is the lsid document { id: <uuid binary> }
         let lsid = if (idIdx >= 0) bson.docGetDoc(reply, idIdx) else "";
         // docGetDoc returns the deserialised sub-document buffer, whose reported length can carry a couple
@@ -237,28 +238,28 @@ pub struct MongoConnection impl Connection {
     // failure reason -- sending on its dead stream would hit the removed Asio path and abort the process.
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
         if (self.failed) {
-            let e = commands.newDoc();
+            let e = operation.newDoc();
             e.entries.push(bson.entryDouble("ok", 0, 0));
             e.entries.push(bson.entryString("errmsg", self.failErr));
             return e;
         }
         let id = self.nextId;
         self.nextId = id + 1;
-        let frame = codec.encodeOpMsg(id, command);
+        let frame = wiremessage.encodeOpMsg(id, command);
         let dummy = await self.io.sendStr(frame);
-        return codec.decodeOpMsg(await readFrame(self.io));
+        return wiremessage.decodeOpMsg(await readFrame(self.io));
     }
 
     pub async fn authenticate(self: MongoConnection, username: string, password: string, clientNonce: string): bool {
         let c = scram.ScramClient{ username: username, password: password, clientNonce: clientNonce };
-        let start = await self.runCommand(commands.saslStartCommand(self.dbName, c.clientFirstMessage()));
+        let start = await self.runCommand(operation.saslStartCommand(self.dbName, c.clientFirstMessage()));
         let convIdx = bson.docFind(start, "conversationId");
         let payloadIdx = bson.docFind(start, "payload");
         if (convIdx < 0 || payloadIdx < 0) { return false; }
         let conversationId = bson.docGetInt(start, convIdx);
         let serverFirst = bson.docGetBinary(start, payloadIdx);
         let clientFinal = c.clientFinalMessage(serverFirst);
-        let cont = await self.runCommand(commands.saslContinueCommand(self.dbName, conversationId, clientFinal));
+        let cont = await self.runCommand(operation.saslContinueCommand(self.dbName, conversationId, clientFinal));
         let doneIdx = bson.docFind(cont, "done");
         return doneIdx >= 0 && bson.docGetBool(cont, doneIdx) != 0;
     }
@@ -272,9 +273,9 @@ pub struct MongoConnection impl Connection {
         if (self.failed) { return db.errorResult(db.DbError("", self.failErr)); }
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
+        let reply = await self.runCommand(operation.findCommand(self.dbName, sql, operation.newDoc()));
         let rs = ResultSet();
-        let err = commands.commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
+        let err = operation.commandError(reply);   // T1: a failed command ({ok:0, errmsg, code}) no longer reads as success
         if (!err.isEmpty()) { rs.err = err; self.busy = false; return rs; }
         rs.columns.push(Column("document", DbType.Text));
 
@@ -301,8 +302,8 @@ pub struct MongoConnection impl Connection {
         if (self.failed) { return errorExec(db.DbError("", self.failErr)); }
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let reply = await self.runCommand(commands.findCommand(self.dbName, sql, commands.newDoc()));
-        let err = commands.commandError(reply);
+        let reply = await self.runCommand(operation.findCommand(self.dbName, sql, operation.newDoc()));
+        let err = operation.commandError(reply);
         if (!err.isEmpty()) { self.busy = false; return errorExec(err); }
         let okIdx = bson.docFind(reply, "ok");
         self.busy = false;
@@ -536,7 +537,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
     // single host. srv:// also implies TLS (unless tls= is set) and may pull replicaSet from a TXT record.
     let seeds = string.split(hostSection, ",");
     if (isSrv) {
-        let sr = srv.resolve(hostSection);
+        let sr = dns.resolve(hostSection);
         if (!sr.ok) { return deadConn(dbName, "mongodb+srv:// resolution failed: " + sr.err); }
         seeds = sr.hosts;
         if (string.eql(dsnParam(dsn, "tls", ""), "")) { useTls = true; }   // srv:// defaults to TLS
@@ -551,7 +552,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         if (seed == "") { continue; }
         let hp = splitHostPort(seed);
         let probe = MongoConnection(await openStream(hp.host, hp.port, useTls, verify, caPem), dbName);
-        let info = parseHello(await probe.runCommand(commands.helloCommand(dbName)));
+        let info = parseHello(await probe.runCommand(operation.helloCommand(dbName)));
         if (!info.ok) { lastErr = "seed " + seed + " unreachable"; continue; }
         if (replicaSet != "" && info.setName != "" && !string.eql(info.setName, replicaSet)) {
             lastErr = "seed " + seed + " is in replica set '" + info.setName + "', wanted '" + replicaSet + "'";
@@ -576,7 +577,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         }
         let thp = splitHostPort(target);
         let tconn = MongoConnection(await openStream(thp.host, thp.port, useTls, verify, caPem), dbName);
-        let tinfo = parseHello(await tconn.runCommand(commands.helloCommand(dbName)));
+        let tinfo = parseHello(await tconn.runCommand(operation.helloCommand(dbName)));
         if (!tinfo.ok) { lastErr = "read-preference target " + target + " unreachable"; continue; }
         // Verify the target actually satisfies the read preference. A seed's `primary` field can be STALE
         // during a failover (it names the node that just stepped down), so a primary-seeking connect must
@@ -654,8 +655,8 @@ pub struct Cursor {
     pub async fn next(self: Cursor): document.Doc | undefined {
         if (self.pos < self.batch.size()) { let d = self.batch.get(self.pos) ?? document.doc(); self.pos = self.pos + 1; return d; }
         if (self.cursorId == 0) { return undefined; }
-        let reply = await self.conn.runCommand(commands.getMoreCommand(self.dbName, self.coll, self.cursorId, 101));
-        let e = commands.commandError(reply);
+        let reply = await self.conn.runCommand(operation.getMoreCommand(self.dbName, self.coll, self.cursorId, 101));
+        let e = operation.commandError(reply);
         if (!e.isEmpty()) { self.err = e; self.cursorId = 0; return undefined; }
         let page = readCursorReply(reply, "nextBatch");
         self.cursorId = page.cursorId;
@@ -679,7 +680,7 @@ pub struct Cursor {
     // Release a not-yet-exhausted server cursor.
     pub async fn close(self: Cursor): void {
         if (self.cursorId != 0) {
-            let _ = await self.conn.runCommand(commands.killCursorsCommand(self.dbName, self.coll, self.cursorId));
+            let _ = await self.conn.runCommand(operation.killCursorsCommand(self.dbName, self.coll, self.cursorId));
             self.cursorId = 0;
         }
     }
@@ -697,7 +698,7 @@ fn isRetryableCode(code: int): bool {
 // on the dead socket), which is retryable; otherwise the write's error code decides.
 fn isRetryableReply(reply: bson.BsonDocument): bool {
     if (isEmptyReply(reply)) { return true; }
-    let e = commands.writeError(reply);
+    let e = operation.writeError(reply);
     if (e.isEmpty()) { return false; }
     return isRetryableCode(e.number);
 }
@@ -718,7 +719,7 @@ fn isNotPrimaryCode(code: int): bool {
 // Does the reply say we have lost the primary (a not-primary error or a dropped connection)?
 fn isNotPrimaryReply(reply: bson.BsonDocument): bool {
     if (isEmptyReply(reply)) { return true; }
-    let e = commands.writeError(reply);
+    let e = operation.writeError(reply);
     if (e.isEmpty()) { return false; }
     return isNotPrimaryCode(e.number);
 }
@@ -814,10 +815,10 @@ pub struct Collection {
 
     // find with server-side filter/projection/sort/skip/limit; returns a lazy Cursor.
     pub async fn find(self: Collection, f: document.Filter, opts: document.FindOptions): Cursor {
-        let cmd = commands.findCommandFull(self.dbName, self.coll, f.toBson(), opts.projection, opts.sort, opts.skip, opts.limit, opts.batchSize);
+        let cmd = operation.findCommandFull(self.dbName, self.coll, f.toBson(), opts.projection, opts.sort, opts.skip, opts.limit, opts.batchSize);
         let reply = await self.run(cmd);
         let cur = Cursor(self.conn, self.dbName, self.coll);
-        let e = commands.commandError(reply);
+        let e = operation.commandError(reply);
         if (!e.isEmpty()) { cur.err = e; return cur; }
         let page = readCursorReply(reply, "firstBatch");
         cur.cursorId = page.cursorId;
@@ -866,8 +867,8 @@ pub struct Collection {
         // Inserts are retryable writes (a batch is idempotent under the same txnNumber). The documents ride
         // in a KIND-1 OP_MSG document sequence (no array nested in the command body) -- the wire-efficient
         // bulk form.
-        let reply = await self.runWriteSeq(commands.insertBodyCommand(self.dbName, self.coll, true), "documents", bdocs, true);
-        let e = commands.writeError(reply);
+        let reply = await self.runWriteSeq(operation.insertBodyCommand(self.dbName, self.coll, true), "documents", bdocs, true);
+        let e = operation.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.insertedCount = numAt(reply, "n");
         return res;
@@ -889,8 +890,8 @@ pub struct Collection {
         // rides in a kind-1 document sequence ("updates").
         let specs = List<bson.BsonDocument>();
         specs.push(updateSpec(f.toBson(), updateBson, upsert, multi));
-        let reply = await self.runWriteSeq(commands.updateBodyCommand(self.dbName, self.coll, true), "updates", specs, !multi);
-        let e = commands.writeError(reply);
+        let reply = await self.runWriteSeq(operation.updateBodyCommand(self.dbName, self.coll, true), "updates", specs, !multi);
+        let e = operation.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.matched = numAt(reply, "n");
         res.modified = numAt(reply, "nModified");
@@ -914,8 +915,8 @@ pub struct Collection {
         // rides in a kind-1 document sequence ("deletes").
         let specs = List<bson.BsonDocument>();
         specs.push(deleteSpec(f.toBson(), limit));
-        let reply = await self.runWriteSeq(commands.deleteBodyCommand(self.dbName, self.coll, true), "deletes", specs, limit == 1);
-        let e = commands.writeError(reply);
+        let reply = await self.runWriteSeq(operation.deleteBodyCommand(self.dbName, self.coll, true), "deletes", specs, limit == 1);
+        let e = operation.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.deletedCount = numAt(reply, "n");
         return res;
@@ -925,7 +926,7 @@ pub struct Collection {
     // if nothing matched (and no upsert).
     pub async fn findOneAndUpdate(self: Collection, f: document.Filter, u: document.Update, returnNew: bool, upsert: bool): document.Doc | undefined {
         // findAndModify targets a single document, so it is retryable.
-        let reply = await self.runWrite(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert), true);
+        let reply = await self.runWrite(operation.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert), true);
         let vIdx = bson.docFind(reply, "value");
         if (vIdx < 0 || bson.docGetType(reply, vIdx) != 3) { return undefined; }   // absent / null (type 10)
         return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
@@ -941,9 +942,9 @@ pub struct Collection {
         let bp = List<bson.BsonDocument>();
         let i = 0;
         while (i < pipeline.size()) { bp.push((pipeline.get(i) ?? document.doc()).bson); i = i + 1; }
-        let reply = await self.run(commands.aggregateCommand(self.dbName, self.coll, bp, 101));
+        let reply = await self.run(operation.aggregateCommand(self.dbName, self.coll, bp, 101));
         let cur = Cursor(self.conn, self.dbName, self.coll);
-        let e = commands.commandError(reply);
+        let e = operation.commandError(reply);
         if (!e.isEmpty()) { cur.err = e; return cur; }
         let page = readCursorReply(reply, "firstBatch");
         cur.cursorId = page.cursorId;
@@ -963,7 +964,7 @@ pub struct Collection {
     }
     // Fast metadata estimate of the whole-collection count (no filter).
     pub async fn estimatedDocumentCount(self: Collection): long {
-        let reply = await self.run(commands.countCommand(self.dbName, self.coll, commands.newDoc()));
+        let reply = await self.run(operation.countCommand(self.dbName, self.coll, operation.newDoc()));
         return numAt(reply, "n");
     }
     // Distinct scalar values of `field` among documents matching `f`, each rendered to its string form
@@ -978,19 +979,19 @@ pub struct Collection {
     // distinct as TYPED values -- each element keeps its real BSON type (string/int/double/bool/objectId/
     // date/doc/array), so callers use v.asInt()/asStr()/... instead of parsing a stringified result.
     pub async fn distinctValues(self: Collection, field: string, f: document.Filter): List<document.Value> {
-        let reply = await self.run(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
+        let reply = await self.run(operation.distinctCommand(self.dbName, self.coll, field, f.toBson()));
         let vIdx = bson.docFind(reply, "values");
         if (vIdx < 0) { return List<document.Value>(); }
         return document.readValues(bson.deserialize(bson.docGetArray(reply, vIdx) as ptr));
     }
     // Create an index over `keys` (e.g. doc().setInt("age", 1)); returns the (classified) DbError, empty on success.
     pub async fn createIndex(self: Collection, keys: document.Doc, name: string, unique: bool): DbError {
-        let reply = await self.conn.runCommand(commands.createIndexCommand(self.dbName, self.coll, keys.bson, name, unique));
-        return commands.commandError(reply);
+        let reply = await self.conn.runCommand(operation.createIndexCommand(self.dbName, self.coll, keys.bson, name, unique));
+        return operation.commandError(reply);
     }
     pub async fn dropIndex(self: Collection, name: string): DbError {
-        let reply = await self.conn.runCommand(commands.dropIndexCommand(self.dbName, self.coll, name));
-        return commands.commandError(reply);
+        let reply = await self.conn.runCommand(operation.dropIndexCommand(self.dbName, self.coll, name));
+        return operation.commandError(reply);
     }
 }
 
@@ -1155,31 +1156,31 @@ pub struct BulkWrite {
         let res = BulkResult();
         let i = 0;
         while (i < self.ops.size()) {
-            let kind = (self.ops.get(i) ?? WriteOp(BULK_INSERT, commands.newDoc())).kind;
+            let kind = (self.ops.get(i) ?? WriteOp(BULK_INSERT, operation.newDoc())).kind;
             let batch = List<bson.BsonDocument>();
             while (i < self.ops.size()) {
-                let op = self.ops.get(i) ?? WriteOp(BULK_INSERT, commands.newDoc());
+                let op = self.ops.get(i) ?? WriteOp(BULK_INSERT, operation.newDoc());
                 if (op.kind != kind) { break; }
                 batch.push(op.spec);
                 i = i + 1;
             }
             // Each batch streams its docs/specs in a kind-1 OP_MSG document sequence.
-            let reply = commands.newDoc();
+            let reply = operation.newDoc();
             if (kind == BULK_INSERT) {
-                reply = await self.coll.runWriteSeq(commands.insertBodyCommand(self.coll.dbName, self.coll.coll, ordered), "documents", batch, false);
+                reply = await self.coll.runWriteSeq(operation.insertBodyCommand(self.coll.dbName, self.coll.coll, ordered), "documents", batch, false);
                 res.insertedCount = res.insertedCount + numAt(reply, "n");
             } else {
                 if (kind == BULK_UPDATE) {
-                    reply = await self.coll.runWriteSeq(commands.updateBodyCommand(self.coll.dbName, self.coll.coll, ordered), "updates", batch, false);
+                    reply = await self.coll.runWriteSeq(operation.updateBodyCommand(self.coll.dbName, self.coll.coll, ordered), "updates", batch, false);
                     res.matchedCount = res.matchedCount + numAt(reply, "n");
                     res.modifiedCount = res.modifiedCount + numAt(reply, "nModified");
                     res.upsertedCount = res.upsertedCount + arraySize(reply, "upserted");
                 } else {
-                    reply = await self.coll.runWriteSeq(commands.deleteBodyCommand(self.coll.dbName, self.coll.coll, ordered), "deletes", batch, false);
+                    reply = await self.coll.runWriteSeq(operation.deleteBodyCommand(self.coll.dbName, self.coll.coll, ordered), "deletes", batch, false);
                     res.deletedCount = res.deletedCount + numAt(reply, "n");
                 }
             }
-            let e = commands.writeError(reply);
+            let e = operation.writeError(reply);
             if (!e.isEmpty()) {
                 res.err = e;
                 if (ordered) { return res; }
@@ -1223,7 +1224,7 @@ pub struct Session {
     pub fn collection(self: Session, dbName: string, coll: string): Collection {
         return Collection(self.conn, dbName, coll).withSession(self);
     }
-    // NOTE: the lsid document is built INLINE here (not via commands.commitTxnCommand) on purpose. Passing
+    // NOTE: the lsid document is built INLINE here (not via operation.commitTxnCommand) on purpose. Passing
     // the raw lsid bytes through a `lsid: string` parameter and then `bson.entryDoc(_, ptr)` launders away
     // ARC ownership of the buffer (entryDoc stores `ptr as string`, an alias), so the aliased bytes can be
     // reused before the command is serialised -> the server sees a corrupt lsid. Referencing `self.lsid`
@@ -1238,7 +1239,7 @@ pub struct Session {
         cmd.entries.push(bson.entryString("$db", "admin"));
         let reply = await self.conn.runCommand(cmd);
         self.inTxn = false;
-        return commands.commandError(reply);
+        return operation.commandError(reply);
     }
     pub async fn abortTransaction(self: Session): DbError {
         if (!self.inTxn) { return db.noError(); }
@@ -1250,6 +1251,6 @@ pub struct Session {
         cmd.entries.push(bson.entryString("$db", "admin"));
         let reply = await self.conn.runCommand(cmd);
         self.inTxn = false;
-        return commands.commandError(reply);
+        return operation.commandError(reply);
     }
 }

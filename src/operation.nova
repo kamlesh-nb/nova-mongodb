@@ -1,6 +1,6 @@
-// commands — MongoDB command builders (SRP: build the BSON documents that are the
+// operation — MongoDB command (operation) builders (SRP: build the BSON documents that are the
 // protocol's "commands", + read a command's error out of a reply). Each builder returns a
-// BSON document ready for codec.encodeOpMsg. A "command" is just a BSON document,
+// BSON document ready for wiremessage.encodeOpMsg. A "command" is just a BSON document,
 // e.g. { find: "users", $db: "test" }.
 import list;
 import serde.bson;

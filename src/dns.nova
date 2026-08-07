@@ -1,4 +1,4 @@
-// srv — a minimal DNS SRV/TXT resolver for `mongodb+srv://` connection strings (SRP: DNS only, no wire
+// dns — a minimal DNS SRV/TXT resolver for `mongodb+srv://` connection strings (SRP: DNS only, no wire
 // or Mongo knowledge). A `mongodb+srv://host/db` URI carries a single host whose `_mongodb._tcp.<host>`
 // SRV records expand to the replica-set seed list, and whose `<host>` TXT record may carry extra options
 // (replicaSet / authSource). This does a ONE-SHOT blocking UDP query at connect time (like the official

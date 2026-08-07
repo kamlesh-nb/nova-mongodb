@@ -1,4 +1,4 @@
-// codec — the OP_MSG wire codec (SRP: bytes <-> frame). Wraps a BSON command
+// wiremessage — the OP_MSG wire codec (SRP: bytes <-> frame). Wraps a BSON command
 // document in an OP_MSG frame and pulls the reply document back out. Pure over byte
 // buffers; the live socket framing (read a whole frame off the stream) is in the seam.
 //
