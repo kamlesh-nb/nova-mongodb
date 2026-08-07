@@ -16,6 +16,7 @@ import bytes;
 import string;
 import list;
 import serde.bson;
+import serde.source;   // ValueSink trait, for serde.dump<T> (DTO struct -> BSON on insert)
 import crypto.scram;
 import crypto.random;
 import net.aio;
@@ -779,6 +780,9 @@ pub struct Collection {
 
     // -- writes (P3) --
 
+    // Insert one document. Pass a @serializable struct DTO wrapped in `docOf(...)` -- it is serialized to
+    // BSON for you -- or a hand-built document.Doc. (serde.dump<T> resolves the concrete type only in a
+    // SYNC context, so the DTO -> Doc conversion is the free function `docOf<T>`, not this async method.)
     pub async fn insertOne(self: Collection, d: document.Doc): InsertResult {
         let docs = List<document.Doc>();
         docs.push(d);
@@ -901,14 +905,19 @@ pub struct Collection {
     // Distinct scalar values of `field` among documents matching `f`, each rendered to its string form
     // (full typed Value results are a follow-on).
     pub async fn distinct(self: Collection, field: string, f: document.Filter): List<string> {
-        let reply = await self.run(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
         let out = List<string>();
-        let vIdx = bson.docFind(reply, "values");
-        if (vIdx < 0) { return out; }
-        let arr = bson.deserialize(bson.docGetArray(reply, vIdx) as ptr);
+        let vs = await self.distinctValues(field, f);
         let i = 0;
-        while (i < arr.entries.size()) { out.push(valueToStr(arr, i)); i = i + 1; }
+        while (i < vs.size()) { out.push((vs.get(i) ?? document.nullValue()).toStr()); i = i + 1; }
         return out;
+    }
+    // distinct as TYPED values -- each element keeps its real BSON type (string/int/double/bool/objectId/
+    // date/doc/array), so callers use v.asInt()/asStr()/... instead of parsing a stringified result.
+    pub async fn distinctValues(self: Collection, field: string, f: document.Filter): List<document.Value> {
+        let reply = await self.run(commands.distinctCommand(self.dbName, self.coll, field, f.toBson()));
+        let vIdx = bson.docFind(reply, "values");
+        if (vIdx < 0) { return List<document.Value>(); }
+        return document.readValues(bson.deserialize(bson.docGetArray(reply, vIdx) as ptr));
     }
     // Create an index over `keys` (e.g. doc().setInt("age", 1)); returns the (classified) DbError, empty on success.
     pub async fn createIndex(self: Collection, keys: document.Doc, name: string, unique: bool): DbError {
@@ -938,6 +947,16 @@ pub async fn open(dsn: string): MongoConnection { return await mongoConnectAsync
 pub fn filter(): document.Filter { return document.filter(); }
 pub fn all(): document.Filter { return document.all(); }
 pub fn doc(): document.Doc { return document.doc(); }
+pub fn nullValue(): document.Value { return document.nullValue(); }
+
+// Serialize a @serializable struct DTO into a Doc, so you can write `coll.insertOne(docOf(myDto))`
+// instead of hand-building the document. SYNC on purpose: serde.dump<T> resolves the concrete type
+// only outside an async frame, so keep the conversion here and the insert async.
+pub fn docOf<T>(dto: T): document.Doc {
+    let sink = document.newMongoSink();
+    serde.dump<T>(dto, sink);
+    return document.wrapDoc(sink.d);
+}
 pub fn findOptions(): document.FindOptions { return document.findOptions(); }
 pub fn update(): document.Update { return document.update(); }
 
@@ -1097,17 +1116,6 @@ fn numAt(reply: bson.BsonDocument, key: string): long {
     return 0;
 }
 
-// Render a scalar BSON value (at index i of an array document) to its string form -- for distinct().
-// A full typed Value union is a follow-on; this covers string/int/double/bool/objectId.
-fn valueToStr(arr: bson.BsonDocument, i: int): string {
-    let t = bson.docGetType(arr, i);
-    if (t == 2) { return bson.docGetString(arr, i); }
-    if (t == 16 || t == 18) { return `${bson.docGetInt64(arr, i)}`; }
-    if (t == 1) { return `${bson.docGetDouble(arr, i)}`; }
-    if (t == 8) { return if (bson.docGetBool(arr, i) != 0) "true" else "false"; }
-    if (t == 7) { return bson.docGetObjectId(arr, i); }
-    return "";
-}
 
 // --- Session + multi-document transactions (P5) --------------------------------------------------
 

@@ -5,6 +5,7 @@
 import list;
 import string;
 import serde.bson;
+import serde.source;   // the ValueSink trait for @serializable struct -> BSON via serde.dump<T>
 
 // --- Doc: a typed document (read + build) ------------------------------------------------------
 
@@ -61,11 +62,108 @@ pub struct Doc {
         if (i < 0 || bson.docGetType(self.bson, i) != 3) { return undefined; }
         return wrapDoc(bson.deserialize(bson.docGetDoc(self.bson, i) as ptr));
     }
+    // An array field as a list of typed Values (undefined when absent or not an array).
+    pub fn getArray(self: Doc, key: string): List<Value> | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 4) { return undefined; }
+        return readValues(bson.deserialize(bson.docGetArray(self.bson, i) as ptr));
+    }
+    // Any field as a typed Value (undefined when the key is absent).
+    pub fn getValue(self: Doc, key: string): Value | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0) { return undefined; }
+        return valueAt(self.bson, i);
+    }
     pub fn toJson(self: Doc): string { return bson.docToJson(self.bson); }
 }
 
 pub fn doc(): Doc { return Doc(); }
 pub fn wrapDoc(b: bson.BsonDocument): Doc { let d = Doc(); d.bson = b; return d; }
+
+// --- DTO -> Doc: serialize a @serializable struct straight into a BSON document -------------------
+
+// A ValueSink that writes each field into a BSON document with the RIGHT Mongo types (int64, not the
+// int32 the SQL ORM's BsonSink uses). serde.dump<T> drives it, calling one put* per struct field.
+pub struct MongoSink impl ValueSink {
+    pub d: bson.BsonDocument,
+    init() { self.d = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() }; }
+    fn putString(self: MongoSink, key: string, val: string): void { self.d.entries.push(bson.entryString(key, val)); }
+    fn putInt(self: MongoSink, key: string, val: long): void { self.d.entries.push(bson.entryInt64Val(key, val)); }
+    fn putBool(self: MongoSink, key: string, val: bool): void { self.d.entries.push(bson.entryBool(key, if (val) 1 else 0)); }
+    fn putFloat(self: MongoSink, key: string, val: double): void { self.d.entries.push(bson.entryDoubleVal(key, val)); }
+    fn putDecimal(self: MongoSink, key: string, val: decimal): void { self.d.entries.push(bson.entryDecimal(key, val)); }
+}
+pub fn newMongoSink(): MongoSink { return MongoSink(); }
+
+// --- Value: a typed BSON element (for distinct results and array elements) -----------------------
+
+// BSON type tags this Value models (int64 is normalized to V_INT). Unmodelled types read as V_UNKNOWN.
+pub const V_UNKNOWN: int = -1;
+pub const V_DOUBLE: int = 1;
+pub const V_STRING: int = 2;
+pub const V_DOC: int = 3;
+pub const V_ARRAY: int = 4;
+pub const V_OBJECTID: int = 7;
+pub const V_BOOL: int = 8;
+pub const V_DATE: int = 9;
+pub const V_NULL: int = 10;
+pub const V_INT: int = 16;
+
+// One typed value pulled out of a BSON array. Typed accessors return `T | undefined` (undefined when the
+// value is not of that type), so `distinct`/array reads keep their real types instead of stringifying.
+pub struct Value {
+    pub kind: int,        // one of V_* (the BSON type tag; int64 tag 18 normalized to V_INT)
+    pub s: string,        // string / ObjectId hex; also the raw sub-document/array bytes for V_DOC/V_ARRAY
+    pub i: long,          // int / int64 / date millis / bool (0 or 1)
+    pub d: double,        // double
+    init(kind: int, s: string, i: long, d: double) { self.kind = kind; self.s = s; self.i = i; self.d = d; }
+
+    pub fn typeTag(self: Value): int { return self.kind; }
+    pub fn isNull(self: Value): bool { return self.kind == V_NULL; }
+    pub fn asStr(self: Value): string | undefined { if (self.kind == V_STRING) { return self.s; } return undefined; }
+    pub fn asInt(self: Value): long | undefined { if (self.kind == V_INT) { return self.i; } return undefined; }
+    pub fn asDouble(self: Value): double | undefined { if (self.kind == V_DOUBLE) { return self.d; } return undefined; }
+    pub fn asBool(self: Value): bool | undefined { if (self.kind == V_BOOL) { return self.i != 0; } return undefined; }
+    pub fn asObjectId(self: Value): string | undefined { if (self.kind == V_OBJECTID) { return self.s; } return undefined; }
+    pub fn asDate(self: Value): long | undefined { if (self.kind == V_DATE) { return self.i; } return undefined; }
+    pub fn asDoc(self: Value): Doc | undefined { if (self.kind == V_DOC) { return wrapDoc(bson.deserialize(self.s as ptr)); } return undefined; }
+    pub fn asArray(self: Value): List<Value> | undefined { if (self.kind == V_ARRAY) { return readValues(bson.deserialize(self.s as ptr)); } return undefined; }
+
+    // A display string for any kind (numbers/bools rendered; doc/array/binary -> "").
+    pub fn toStr(self: Value): string {
+        if (self.kind == V_STRING || self.kind == V_OBJECTID) { return self.s; }
+        if (self.kind == V_INT || self.kind == V_DATE) { return `${self.i}`; }
+        if (self.kind == V_DOUBLE) { return `${self.d}`; }
+        if (self.kind == V_BOOL) { return if (self.i != 0) "true" else "false"; }
+        if (self.kind == V_NULL) { return "null"; }
+        return "";
+    }
+}
+
+pub fn nullValue(): Value { return Value(V_NULL, "", 0, 0.0); }
+
+// Read the element at index `i` of a BSON array/document as a typed Value.
+pub fn valueAt(arr: bson.BsonDocument, i: int): Value {
+    let t = bson.docGetType(arr, i);
+    if (t == 2) { return Value(V_STRING, bson.docGetString(arr, i), 0, 0.0); }
+    if (t == 16 || t == 18) { return Value(V_INT, "", bson.docGetInt64(arr, i), 0.0); }
+    if (t == 1) { return Value(V_DOUBLE, "", 0, bson.docGetDouble(arr, i)); }
+    if (t == 8) { return Value(V_BOOL, "", bson.docGetBool(arr, i), 0.0); }
+    if (t == 7) { return Value(V_OBJECTID, bson.docGetObjectId(arr, i), 0, 0.0); }
+    if (t == 9) { return Value(V_DATE, "", bson.docGetDate(arr, i), 0.0); }
+    if (t == 3) { return Value(V_DOC, bson.docGetDoc(arr, i), 0, 0.0); }
+    if (t == 4) { return Value(V_ARRAY, bson.docGetArray(arr, i), 0, 0.0); }
+    if (t == 10) { return Value(V_NULL, "", 0, 0.0); }
+    return Value(V_UNKNOWN, "", 0, 0.0);
+}
+
+// Read every element of a BSON array/document as typed Values.
+pub fn readValues(arr: bson.BsonDocument): List<Value> {
+    let out = List<Value>();
+    let i = 0;
+    while (i < arr.entries.size()) { out.push(valueAt(arr, i)); i = i + 1; }
+    return out;
+}
 
 // --- Filter: a fluent query builder that lowers to a BSON filter document -----------------------
 
