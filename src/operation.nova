@@ -137,6 +137,36 @@ pub fn aggregateCommand(dbName: string, coll: string, pipeline: List<bson.BsonDo
     return d;
 }
 
+/// The `{ $changeStream: { ... } }` aggregation stage that opens a change stream. `fullDocument` (e.g.
+/// "updateLookup") is omitted when "" or "default"; `resumeAfter` carries a resume-token sub-document
+/// (empty = start from now). This is the stage the driver prepends to the user pipeline.
+pub fn changeStreamStage(fullDocument: string, resumeAfter: bson.BsonDocument): bson.BsonDocument {
+    let cs = newDoc();
+    if (fullDocument != "" && fullDocument != "default") { cs.entries.push(bson.entryString("fullDocument", fullDocument)); }
+    if (resumeAfter.entries.size() > 0) { cs.entries.push(bson.entryDoc("resumeAfter", bson.serialize(resumeAfter))); }
+    let stage = newDoc();
+    stage.entries.push(bson.entryDoc("$changeStream", bson.serialize(cs)));
+    return stage;
+}
+
+/// { aggregate: <coll>, pipeline: [{$changeStream}, <user stages>...], cursor: { batchSize }, $db } --
+/// opens a change stream. batchSize 0 makes the initial aggregate return immediately (recommended).
+pub fn changeStreamCommand(dbName: string, coll: string, csStage: bson.BsonDocument, userPipeline: List<bson.BsonDocument>, batchSize: int): bson.BsonDocument {
+    let pipe = list.List<bson.BsonDocument>();
+    pipe.push(csStage);
+    let i = 0;
+    while (i < userPipeline.size()) { pipe.push(userPipeline.get(i) ?? newDoc()); i = i + 1; }
+    return aggregateCommand(dbName, coll, pipe, batchSize);
+}
+
+/// getMore with `maxTimeMS` -- the awaitData window a tailable (change-stream) cursor blocks server-side
+/// waiting for the next event before returning an empty batch.
+pub fn getMoreAwaitCommand(dbName: string, coll: string, cursorId: long, batchSize: int, maxAwaitMs: int): bson.BsonDocument {
+    let d = getMoreCommand(dbName, coll, cursorId, batchSize);
+    if (maxAwaitMs > 0) { d.entries.push(bson.entryInt("maxTimeMS", maxAwaitMs)); }
+    return d;
+}
+
 /// { count: <coll>, query: <filter>, $db } — a fast metadata count (query omitted = whole collection).
 pub fn countCommand(dbName: string, coll: string, filter: bson.BsonDocument): bson.BsonDocument {
     let d = newDoc();

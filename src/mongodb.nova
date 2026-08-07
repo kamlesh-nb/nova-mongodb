@@ -686,6 +686,139 @@ pub struct Cursor {
     }
 }
 
+// Read the cursor's postBatchResumeToken (the resume token covering everything up to this batch, present
+// on change-stream replies even when the batch is empty), or undefined when absent.
+fn readPbrt(reply: bson.BsonDocument): bson.BsonDocument | undefined {
+    let cursorIdx = bson.docFind(reply, "cursor");
+    if (cursorIdx < 0) { return undefined; }
+    let cursorDoc = bson.deserialize(bson.docGetDoc(reply, cursorIdx) as ptr);
+    let pIdx = bson.docFind(cursorDoc, "postBatchResumeToken");
+    if (pIdx < 0 || bson.docGetType(cursorDoc, pIdx) != 3) { return undefined; }
+    return bson.deserialize(bson.docGetDoc(cursorDoc, pIdx) as ptr);
+}
+
+// A change stream: a tailable cursor over a collection's change events (insert/update/replace/delete/
+// invalidate/...), opened via aggregate with a leading {$changeStream} stage. It tracks a resume token
+// (each event's `_id`, plus the cursor's postBatchResumeToken) so a dropped primary is resumed
+// transparently: reconnect + reopen with resumeAfter the last token. tryNext() polls once (blocking up to
+// maxAwaitMs server-side) and returns undefined when the window elapsed with no event; next() loops
+// tryNext across idle windows until an event arrives or the stream is invalidated.
+pub struct ChangeStream {
+    pub conn: MongoConnection,
+    pub dbName: string,
+    pub coll: string,
+    pub cursorId: long,
+    pub batch: List<document.Doc>,
+    pub pos: int,
+    pub fullDocument: string,
+    pub userPipeline: List<document.Doc>,
+    pub batchSize: int,
+    pub maxAwaitMs: int,
+    pub resumeTokenDoc: bson.BsonDocument,   // last resume token (an event `_id` or the PBRT)
+    pub hasToken: bool,
+    pub started: bool,
+    pub err: DbError,
+    init(conn: MongoConnection, dbName: string, coll: string) {
+        self.conn = conn; self.dbName = dbName; self.coll = coll;
+        self.cursorId = 0; self.batch = List<document.Doc>(); self.pos = 0;
+        self.fullDocument = ""; self.userPipeline = List<document.Doc>();
+        self.batchSize = 0; self.maxAwaitMs = 1000;
+        self.resumeTokenDoc = bson.BsonDocument{ entries: List<bson.BsonEntry>() }; self.hasToken = false;
+        self.started = false; self.err = db.noError();
+    }
+    pub fn ok(self: ChangeStream): bool { return self.err.isEmpty(); }
+    pub fn id(self: ChangeStream): long { return self.cursorId; }
+    // The last resume token seen (undefined before the first reply). Persist it to resume a stream later
+    // by passing it back on watch via resumeAfter.
+    pub fn token(self: ChangeStream): document.Doc | undefined {
+        if (!self.hasToken) { return undefined; }
+        return document.wrapDoc(self.resumeTokenDoc);
+    }
+
+    // Track the cursor's postBatchResumeToken so an idle window (no events) still advances the resume point.
+    fn absorbPbrt(self: ChangeStream, reply: bson.BsonDocument): void {
+        let pbrt = readPbrt(reply);
+        if (pbrt != undefined) { self.resumeTokenDoc = pbrt; self.hasToken = true; }
+    }
+
+    // Open (or reopen, after a drop) the underlying aggregate cursor, resuming from the last token when we
+    // have one. Returns false and sets err on a hard failure.
+    pub async fn openCursor(self: ChangeStream): bool {
+        let after = bson.BsonDocument{ entries: List<bson.BsonEntry>() };
+        if (self.hasToken) { after = self.resumeTokenDoc; }
+        let stage = operation.changeStreamStage(self.fullDocument, after);
+        let up = List<bson.BsonDocument>();
+        let i = 0;
+        while (i < self.userPipeline.size()) { up.push((self.userPipeline.get(i) ?? document.doc()).bson); i = i + 1; }
+        let reply = await self.conn.runCommandFailover(operation.changeStreamCommand(self.dbName, self.coll, stage, up, self.batchSize));
+        let e = operation.commandError(reply);
+        if (!e.isEmpty()) { self.err = e; self.cursorId = 0; return false; }
+        let page = readCursorReply(reply, "firstBatch");
+        self.cursorId = page.cursorId;
+        self.batch = page.docs;
+        self.pos = 0;
+        self.absorbPbrt(reply);
+        self.started = true;
+        return true;
+    }
+
+    // One poll: return the next buffered event, else getMore once (blocking up to maxAwaitMs server-side).
+    // Returns undefined when the window elapsed with no new event (the stream stays open -- poll again).
+    pub async fn tryNext(self: ChangeStream): document.Doc | undefined {
+        if (!self.started) { let _o0 = await self.openCursor(); }
+        if (self.pos < self.batch.size()) {
+            let d = self.batch.get(self.pos) ?? document.doc();
+            self.pos = self.pos + 1;
+            let idt = d.getDoc("_id");
+            if (idt != undefined) { self.resumeTokenDoc = idt.bson; self.hasToken = true; }
+            return d;
+        }
+        if (self.cursorId == 0) { return undefined; }   // stream invalidated / errored
+        let reply = await self.conn.runCommand(operation.getMoreAwaitCommand(self.dbName, self.coll, self.cursorId, self.batchSize, self.maxAwaitMs));
+        // A dropped primary / not-primary reply: reconnect and reopen from the last token, then poll fresh.
+        if (isRetryableReply(reply) || isNotPrimaryReply(reply)) {
+            let _r = await self.conn.reconnect();
+            self.started = false;
+            let _o = await self.openCursor();
+            return undefined;   // let the caller poll again on the fresh cursor
+        }
+        let e = operation.commandError(reply);
+        if (!e.isEmpty()) { self.err = e; self.cursorId = 0; return undefined; }
+        let page = readCursorReply(reply, "nextBatch");
+        self.cursorId = page.cursorId;   // 0 here means the stream was invalidated (collection dropped etc.)
+        self.batch = page.docs;
+        self.pos = 0;
+        self.absorbPbrt(reply);
+        if (self.batch.size() == 0) { return undefined; }   // idle window, no events
+        let d2 = self.batch.get(0) ?? document.doc();
+        self.pos = 1;
+        let idt2 = d2.getDoc("_id");
+        if (idt2 != undefined) { self.resumeTokenDoc = idt2.bson; self.hasToken = true; }
+        return d2;
+    }
+
+    // Block until the next change event arrives (or the stream errors / is invalidated), looping tryNext
+    // across idle windows. `maxPolls` bounds the wait to maxPolls * maxAwaitMs; pass 0 to poll forever.
+    pub async fn next(self: ChangeStream, maxPolls: int): document.Doc | undefined {
+        let n = 0;
+        while (maxPolls <= 0 || n < maxPolls) {
+            let d = await self.tryNext();
+            if (d != undefined) { return d; }
+            if (self.cursorId == 0) { return undefined; }   // hard error or invalidated -> stop
+            n = n + 1;
+        }
+        return undefined;
+    }
+
+    // Release the server-side cursor. A change stream never self-exhausts, so always close it when done.
+    pub async fn close(self: ChangeStream): void {
+        if (self.cursorId != 0) {
+            let _ = await self.conn.runCommand(operation.killCursorsCommand(self.dbName, self.coll, self.cursorId));
+            self.cursorId = 0;
+        }
+    }
+}
+
 // Error codes that mark a write as safe to retry (the retryable-writes spec's retryable set): network /
 // not-writable-primary / interrupted-at-shutdown / stepped-down and friends. NOT duplicate-key (11000)
 // or validation (121) -- retrying those cannot help.
@@ -992,6 +1125,30 @@ pub struct Collection {
     pub async fn dropIndex(self: Collection, name: string): DbError {
         let reply = await self.conn.runCommand(operation.dropIndexCommand(self.dbName, self.coll, name));
         return operation.commandError(reply);
+    }
+
+    // Open a change stream on this collection. `pipeline` is extra aggregation stages applied AFTER the
+    // {$changeStream} stage (empty for none); `fullDocument` (e.g. "updateLookup", "" for default) controls
+    // whether update events carry the post-image. Poll it with next()/tryNext(); close() when done.
+    pub async fn watch(self: Collection, pipeline: List<document.Doc>, fullDocument: string): ChangeStream {
+        let cs = ChangeStream(self.conn, self.dbName, self.coll);
+        cs.userPipeline = pipeline;
+        cs.fullDocument = fullDocument;
+        let _ = await cs.openCursor();
+        return cs;
+    }
+    // Watch the whole collection with defaults (no extra stages, default fullDocument).
+    pub async fn watchAll(self: Collection): ChangeStream {
+        return await self.watch(List<document.Doc>(), "");
+    }
+    // Resume a change stream from a previously saved token (from ChangeStream.token()).
+    pub async fn watchFrom(self: Collection, resumeToken: document.Doc, fullDocument: string): ChangeStream {
+        let cs = ChangeStream(self.conn, self.dbName, self.coll);
+        cs.fullDocument = fullDocument;
+        cs.resumeTokenDoc = resumeToken.bson;
+        cs.hasToken = true;
+        let _ = await cs.openCursor();
+        return cs;
     }
 }
 
