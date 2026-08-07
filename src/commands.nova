@@ -99,80 +99,18 @@ fn oneDocArray(d: bson.BsonDocument): ptr {
     return bson.serialize(arr);
 }
 
-/// { insert: <coll>, documents: [<doc>...], ordered: true, $db } — one or more documents.
-pub fn insertManyCommand(dbName: string, coll: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
+/// A write command BODY only (no documents/updates/deletes array) -- the payload rides in a kind-1
+/// OP_MSG document sequence (encodeOpMsgSeq). Wire-efficient for bulk: no array nested in the command.
+fn writeBodyCommand(op: string, coll: string, dbName: string, ordered: bool): bson.BsonDocument {
     let d = newDoc();
-    d.entries.push(bson.entryString("insert", coll));
-    d.entries.push(bson.entryArray("documents", docArray(docs)));
-    d.entries.push(bson.entryBool("ordered", 1));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// bulkWrite building blocks (a single command carrying MANY specs). `insertManyCommandOrdered` is
-/// insertManyCommand with an explicit ordered flag; the bulk update/delete commands take an array of
-/// pre-built specs ({ q, u, upsert, multi } / { q, limit }).
-pub fn insertManyCommandOrdered(dbName: string, coll: string, docs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("insert", coll));
-    d.entries.push(bson.entryArray("documents", docArray(docs)));
+    d.entries.push(bson.entryString(op, coll));
     d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
     d.entries.push(bson.entryString("$db", dbName));
     return d;
 }
-pub fn bulkUpdateCommand(dbName: string, coll: string, specs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("update", coll));
-    d.entries.push(bson.entryArray("updates", docArray(specs)));
-    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-/// The insert command BODY only (no `documents` array) -- the documents ride in a kind-1 OP_MSG
-/// document sequence (codec.encodeOpMsgSeq). Wire-efficient for bulk: no array nested in the command.
-pub fn insertBodyCommand(dbName: string, coll: string, ordered: bool): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("insert", coll));
-    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-pub fn bulkDeleteCommand(dbName: string, coll: string, specs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
-    let d = newDoc();
-    d.entries.push(bson.entryString("delete", coll));
-    d.entries.push(bson.entryArray("deletes", docArray(specs)));
-    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// { update: <coll>, updates: [{ q, u, upsert, multi }], $db }.
-pub fn updateCommand(dbName: string, coll: string, filter: bson.BsonDocument, updateDoc: bson.BsonDocument,
-                     upsert: bool, multi: bool): bson.BsonDocument {
-    let u = newDoc();
-    u.entries.push(bson.entryDoc("q", bson.serialize(filter)));
-    u.entries.push(bson.entryDoc("u", bson.serialize(updateDoc)));
-    u.entries.push(bson.entryBool("upsert", if (upsert) 1 else 0));
-    u.entries.push(bson.entryBool("multi", if (multi) 1 else 0));
-    let d = newDoc();
-    d.entries.push(bson.entryString("update", coll));
-    d.entries.push(bson.entryArray("updates", oneDocArray(u)));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
-
-/// { delete: <coll>, deletes: [{ q, limit }], $db }. limit 1 = one, 0 = all.
-pub fn deleteCommand(dbName: string, coll: string, filter: bson.BsonDocument, limit: int): bson.BsonDocument {
-    let del = newDoc();
-    del.entries.push(bson.entryDoc("q", bson.serialize(filter)));
-    del.entries.push(bson.entryInt("limit", limit));
-    let d = newDoc();
-    d.entries.push(bson.entryString("delete", coll));
-    d.entries.push(bson.entryArray("deletes", oneDocArray(del)));
-    d.entries.push(bson.entryString("$db", dbName));
-    return d;
-}
+pub fn insertBodyCommand(dbName: string, coll: string, ordered: bool): bson.BsonDocument { return writeBodyCommand("insert", coll, dbName, ordered); }
+pub fn updateBodyCommand(dbName: string, coll: string, ordered: bool): bson.BsonDocument { return writeBodyCommand("update", coll, dbName, ordered); }
+pub fn deleteBodyCommand(dbName: string, coll: string, ordered: bool): bson.BsonDocument { return writeBodyCommand("delete", coll, dbName, ordered); }
 
 /// { findAndModify: <coll>, query, update, new, upsert, $db } — returns the pre- or post-image.
 pub fn findAndModifyCommand(dbName: string, coll: string, filter: bson.BsonDocument, updateDoc: bson.BsonDocument,

@@ -783,7 +783,7 @@ pub struct Collection {
     // ride in the sequence identified by `seqId`. Retryable-write context (lsid/txnNumber) and a
     // reconnect-on-not-primary retry are applied to the body exactly as runWrite does; inside a
     // transaction the sequence write joins the txn.
-    async fn runWriteSeq(self: Collection, bodyCmd: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>, retryable: bool): bson.BsonDocument {
+    pub async fn runWriteSeq(self: Collection, bodyCmd: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>, retryable: bool): bson.BsonDocument {
         let s = self.sess;
         if (s != undefined) {
             if (s.inTxn) {
@@ -885,8 +885,11 @@ pub struct Collection {
     }
     async fn doUpdate(self: Collection, f: document.Filter, updateBson: bson.BsonDocument, upsert: bool, multi: bool): UpdateResult {
         let res = UpdateResult();
-        // A single-document update (multi == false) is retryable; a multi update is not.
-        let reply = await self.runWrite(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi), !multi);
+        // A single-document update (multi == false) is retryable; a multi update is not. The update spec
+        // rides in a kind-1 document sequence ("updates").
+        let specs = List<bson.BsonDocument>();
+        specs.push(updateSpec(f.toBson(), updateBson, upsert, multi));
+        let reply = await self.runWriteSeq(commands.updateBodyCommand(self.dbName, self.coll, true), "updates", specs, !multi);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.matched = numAt(reply, "n");
@@ -907,8 +910,11 @@ pub struct Collection {
     pub async fn deleteMany(self: Collection, f: document.Filter): DeleteResult { return await self.doDelete(f, 0); }
     async fn doDelete(self: Collection, f: document.Filter, limit: int): DeleteResult {
         let res = DeleteResult();
-        // A single-document delete (limit == 1) is retryable; an unlimited delete is not.
-        let reply = await self.runWrite(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit), limit == 1);
+        // A single-document delete (limit == 1) is retryable; an unlimited delete is not. The delete spec
+        // rides in a kind-1 document sequence ("deletes").
+        let specs = List<bson.BsonDocument>();
+        specs.push(deleteSpec(f.toBson(), limit));
+        let reply = await self.runWriteSeq(commands.deleteBodyCommand(self.dbName, self.coll, true), "deletes", specs, limit == 1);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.deletedCount = numAt(reply, "n");
@@ -1157,18 +1163,19 @@ pub struct BulkWrite {
                 batch.push(op.spec);
                 i = i + 1;
             }
+            // Each batch streams its docs/specs in a kind-1 OP_MSG document sequence.
             let reply = commands.newDoc();
             if (kind == BULK_INSERT) {
-                reply = await self.coll.runWrite(commands.insertManyCommandOrdered(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                reply = await self.coll.runWriteSeq(commands.insertBodyCommand(self.coll.dbName, self.coll.coll, ordered), "documents", batch, false);
                 res.insertedCount = res.insertedCount + numAt(reply, "n");
             } else {
                 if (kind == BULK_UPDATE) {
-                    reply = await self.coll.runWrite(commands.bulkUpdateCommand(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                    reply = await self.coll.runWriteSeq(commands.updateBodyCommand(self.coll.dbName, self.coll.coll, ordered), "updates", batch, false);
                     res.matchedCount = res.matchedCount + numAt(reply, "n");
                     res.modifiedCount = res.modifiedCount + numAt(reply, "nModified");
                     res.upsertedCount = res.upsertedCount + arraySize(reply, "upserted");
                 } else {
-                    reply = await self.coll.runWrite(commands.bulkDeleteCommand(self.coll.dbName, self.coll.coll, batch, ordered), false);
+                    reply = await self.coll.runWriteSeq(commands.deleteBodyCommand(self.coll.dbName, self.coll.coll, ordered), "deletes", batch, false);
                     res.deletedCount = res.deletedCount + numAt(reply, "n");
                 }
             }
