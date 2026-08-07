@@ -68,6 +68,10 @@ pub struct MongoConnection impl Connection {
     pub busy: bool,              // concurrency guard: one in-flight request per connection
     pub failed: bool,            // set when connect/auth failed: the connection is dead
     pub failErr: string,         // the failure reason surfaced to the first query/exec
+    // P6 topology observability: what the SDAM discovery resolved this connection to.
+    pub setName: string,         // the replica-set name the server reports ("" for a standalone)
+    pub serverHost: string,      // the host:port we are actually connected to (the selected node)
+    pub members: List<string>,   // all replica-set members the primary advertised (host:port)
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
@@ -76,10 +80,17 @@ pub struct MongoConnection impl Connection {
         self.busy = false;
         self.failed = false;
         self.failErr = "";
+        self.setName = "";
+        self.serverHost = "";
+        self.members = List<string>();
     }
     // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
     // instead of pretending to be live (auth used to be checked-but-ignored).
     pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
+    // Record the topology this connection resolved to (SDAM discovery result).
+    pub fn setTopology(self: MongoConnection, setName: string, host: string, members: List<string>): void {
+        self.setName = setName; self.serverHost = host; self.members = members;
+    }
 
     // The native document API entry point: `conn.database("shop").collection("users").find(...)`.
     pub fn database(self: MongoConnection, name: string): Database { return Database(self, name); }
@@ -232,27 +243,126 @@ fn dsnParam(dsn: string, key: string, dflt: string): string {
     return string.slice(rest, 0, amp);
 }
 
-// Build the connection over `io`, then run the MongoDB handshake: `hello` (negotiate wire version /
-// topology), and SCRAM-SHA-256 `authenticate` when the DSN carried credentials. Passing the concrete
-// stream into this AsyncIO param is a widening (the safe direction).
-async fn mongoFinish(io: aio.AsyncIO, dbName: string, user: string, pass: string): MongoConnection {
-    let conn = MongoConnection(io, dbName);
-    let hi = await conn.runCommand(commands.helloCommand(dbName));   // handshake -- was never sent before
+// --- P6: replica-set topology (SDAM core), read preference, seed lists ---------------------------
+
+// Read-preference modes (the subset that matters for replica-set node selection).
+pub const RP_PRIMARY: int = 0;
+pub const RP_PRIMARY_PREFERRED: int = 1;
+pub const RP_SECONDARY: int = 2;
+pub const RP_SECONDARY_PREFERRED: int = 3;
+pub const RP_NEAREST: int = 4;
+
+fn parseReadPref(s: string): int {
+    if (string.eql(s, "primaryPreferred")) { return RP_PRIMARY_PREFERRED; }
+    if (string.eql(s, "secondary")) { return RP_SECONDARY; }
+    if (string.eql(s, "secondaryPreferred")) { return RP_SECONDARY_PREFERRED; }
+    if (string.eql(s, "nearest")) { return RP_NEAREST; }
+    return RP_PRIMARY;
+}
+
+struct HostPort { pub host: string, pub port: int, init(h: string, p: int) { self.host = h; self.port = p; } }
+
+// Split "host:port" (defaulting the port to 27017). Seed lists from a mongodb:// URI and replica-set
+// configs advertise host names / IPv4, so a bracketed IPv6 literal is out of scope here.
+fn splitHostPort(hp: string): HostPort {
+    let c = string.lastIndexOf(hp, ":");
+    if (c < 0) { return HostPort(hp, 27017); }
+    let pn = string.parseI64(string.slice(hp, c + 1, hp.length));
+    return HostPort(string.slice(hp, 0, c), if (pn > 0) pn as int else 27017);
+}
+
+// What a `hello` reply tells us about the topology.
+struct HelloInfo {
+    pub ok: bool,            // the reply actually came back from a server (false = seed unreachable)
+    pub isPrimary: bool,     // isWritablePrimary
+    pub setName: string,     // replica-set name ("" for a standalone)
+    pub primary: string,     // host:port of the current primary as this node sees it ("" if unknown)
+    pub hosts: List<string>, // all advertised members (host:port)
+    init() { self.ok = false; self.isPrimary = false; self.setName = ""; self.primary = ""; self.hosts = List<string>(); }
+}
+
+fn parseHello(reply: bson.BsonDocument): HelloInfo {
+    let hi = HelloInfo();
+    // A live server always echoes maxWireVersion (and ok); its absence means the seed was unreachable
+    // (readFrame returned "" on the dead socket and decodeOpMsg produced an empty document).
+    if (bson.docFind(reply, "maxWireVersion") < 0 && bson.docFind(reply, "ok") < 0) { return hi; }
+    hi.ok = true;
+    let pIdx = bson.docFind(reply, "isWritablePrimary");
+    if (pIdx >= 0) { hi.isPrimary = bson.docGetBool(reply, pIdx) != 0; }
+    let sIdx = bson.docFind(reply, "setName");
+    if (sIdx >= 0) { hi.setName = bson.docGetString(reply, sIdx); }
+    let prIdx = bson.docFind(reply, "primary");
+    if (prIdx >= 0) { hi.primary = bson.docGetString(reply, prIdx); }
+    let hIdx = bson.docFind(reply, "hosts");
+    if (hIdx >= 0) {
+        let arr = bson.deserialize(bson.docGetArray(reply, hIdx) as ptr);
+        let i = 0;
+        while (i < arr.entries.size()) {
+            if (bson.docGetType(arr, i) == 2) { hi.hosts.push(bson.docGetString(arr, i)); }
+            i = i + 1;
+        }
+    }
+    return hi;
+}
+
+// Open a raw async stream to host:port honouring the TLS options; widening to the AsyncIO seam.
+// MongoDB uses IMPLICIT TLS (encryption from the first byte), so tlsConnect[Verify] (TLS 1.3, pure
+// Nova) is the whole story; `tls=verify` enforces the certificate chain.
+async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: string): aio.AsyncIO {
+    if (useTls) {
+        if (verify) { return await asynctls.tlsConnectVerify(host, port, caPem); }
+        return await asynctls.tlsConnect(host, port, false);
+    }
+    return await aio.asyncConnect(host, port);
+}
+
+// SCRAM-authenticate an already-connected + hello'd connection (nonce from the CSPRNG, never reused).
+async fn finishAuth(conn: MongoConnection, user: string, pass: string): MongoConnection {
     if (user != "") {
-        // authenticate against the auth db (the connection db here). Nonce is generated per-connection
-        // from the CSPRNG (never caller-supplied / reused).
         let ok = await conn.authenticate(user, pass, random.randomHex(18));
         if (!ok) { conn.markFailed("mongodb: authentication failed for user '" + user + "'"); }
     }
     return conn;
 }
 
-// DSN: [mongodb://][user:pass@]host[:port][/db][?tls=true|verify&tlsCAFile=...]
+// Choose the member to talk to for a read preference. Secondaries are the members other than the
+// primary. On a single-node set there are none, so secondary/nearest degrade to the primary (rather
+// than failing the connect) -- the honest behaviour for a set that has no secondary to route to.
+fn selectTarget(primary: string, hosts: List<string>, readPref: int): string {
+    if (readPref == RP_PRIMARY || readPref == RP_PRIMARY_PREFERRED) { return primary; }
+    let i = 0;
+    while (i < hosts.size()) {
+        let h = hosts.get(i) ?? "";
+        if (h != "" && !string.eql(h, primary)) { return h; }
+        i = i + 1;
+    }
+    return primary;
+}
+
+// A connection object over a dead (fd -1) stream, so a discovery failure still returns a Connection
+// whose first query/exec surfaces the reason (never a null / crash).
+fn deadConn(dbName: string, why: string): MongoConnection {
+    let c = MongoConnection(aio.AsyncStream((0 - 1) as long), dbName);
+    c.markFailed(why);
+    return c;
+}
+
+// DSN forms:
+//   mongodb://[user:pass@]host[:port][,host2[:port2]...][/db][?replicaSet=NAME&readPreference=..&tls=..]
+//   mongodb+srv://...   -- DNS SRV/TXT expansion is a follow-on; this fails loudly (see below) rather
+//                          than silently connecting to the wrong place.
+// Given a seed list, the driver runs SDAM discovery: `hello` each seed until one answers, learns the
+// replica-set name + members + current primary, then connects (and SCRAM-auths) to the read-preference
+// target. Unreachable seeds are skipped, so a stale/dead seed in the list does not fail the connect.
 async fn mongoConnectAsync(dsn: string): MongoConnection {
     let tlsOpt = dsnParam(dsn, "tls", "false");
     let useTls = string.eql(tlsOpt, "true") || string.eql(tlsOpt, "verify");
     let verify = string.eql(tlsOpt, "verify");
     let caFile = dsnParam(dsn, "tlsCAFile", "");
+    let caPem = if (verify && caFile != "") File.readText(caFile) else "";
+    let replicaSet = dsnParam(dsn, "replicaSet", "");
+    let readPref = parseReadPref(dsnParam(dsn, "readPreference", "primary"));
+    let isSrv = string.indexOf(dsn, "mongodb+srv://") == 0;
 
     let base = dsn;
     let qq = string.indexOf(base, "?");
@@ -272,32 +382,60 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         else { user = string.slice(cred, 0, cc); pass = string.slice(cred, cc + 1, cred.length); }
     }
 
-    let hostEnd = string.indexOf(base, ":");
-    let host = if (hostEnd >= 0) string.slice(base, 0, hostEnd) else "127.0.0.1";
-    let rest = if (hostEnd >= 0) string.slice(base, hostEnd + 1, base.length) else base;
-    let portEnd = string.indexOf(rest, "/");
-    let portStr = if (portEnd >= 0) string.slice(rest, 0, portEnd) else rest;
-    let dbName = if (portEnd >= 0) string.slice(rest, portEnd + 1, rest.length) else "test";
-    let port = string.parseI64(portStr);
-    let p = if (port > 0) port else 27017;
+    // Split the host section (which may be a comma-separated seed list) from the database name.
+    let slash = string.indexOf(base, "/");
+    let hostSection = if (slash >= 0) string.slice(base, 0, slash) else base;
+    let dbName0 = if (slash >= 0) string.slice(base, slash + 1, base.length) else "test";
+    let dbName = if (dbName0 != "") dbName0 else "test";
 
-    // MongoDB uses IMPLICIT TLS (encryption starts at the first byte, no plaintext negotiation), so
-    // tlsConnect[Verify] (TLS 1.3, pure Nova) is the whole story. `tls=verify` enforces the chain.
-    if (useTls) {
-        if (verify) {
-            let caPem = if (caFile != "") File.readText(caFile) else "";
-            let ts = await asynctls.tlsConnectVerify(host, p, caPem);
-            return await mongoFinish(ts, dbName, user, pass);
-        }
-        let ts2 = await asynctls.tlsConnect(host, p, false);
-        return await mongoFinish(ts2, dbName, user, pass);
+    if (isSrv) {
+        return deadConn(dbName, "mongodb+srv:// (DNS SRV) is not yet supported; use the seed-list form "
+            + "mongodb://host1:port1,host2:port2/db?replicaSet=NAME");
     }
-    let stream = await aio.asyncConnect(host, p);
-    return await mongoFinish(stream, dbName, user, pass);
+
+    let seeds = string.split(hostSection, ",");
+    let lastErr = "no seeds in DSN";
+    let i = 0;
+    while (i < seeds.size()) {
+        let seed = string.trim(seeds.get(i) ?? "");
+        i = i + 1;
+        if (seed == "") { continue; }
+        let hp = splitHostPort(seed);
+        let probe = MongoConnection(await openStream(hp.host, hp.port, useTls, verify, caPem), dbName);
+        let info = parseHello(await probe.runCommand(commands.helloCommand(dbName)));
+        if (!info.ok) { lastErr = "seed " + seed + " unreachable"; continue; }
+        if (replicaSet != "" && info.setName != "" && !string.eql(info.setName, replicaSet)) {
+            lastErr = "seed " + seed + " is in replica set '" + info.setName + "', wanted '" + replicaSet + "'";
+            continue;
+        }
+        // Where is the primary? A primary seed knows it is itself; a secondary reports it in `primary`.
+        let primary = if (info.isPrimary) seed else info.primary;
+        if (!info.isPrimary && primary == "") {
+            lastErr = "seed " + seed + " reachable but reports no primary yet (election in progress?)";
+            continue;
+        }
+        let target = selectTarget(primary, info.hosts, readPref);
+        // If the reachable seed already IS the target node, reuse its connection instead of dialling again.
+        if (info.ok && string.eql(target, seed) && info.isPrimary) {
+            let c = await finishAuth(probe, user, pass);
+            c.setTopology(info.setName, seed, info.hosts);
+            return c;
+        }
+        let thp = splitHostPort(target);
+        let tconn = MongoConnection(await openStream(thp.host, thp.port, useTls, verify, caPem), dbName);
+        let tinfo = parseHello(await tconn.runCommand(commands.helloCommand(dbName)));
+        if (!tinfo.ok) { lastErr = "read-preference target " + target + " unreachable"; continue; }
+        let c = await finishAuth(tconn, user, pass);
+        c.setTopology(tinfo.setName, target, tinfo.hosts);
+        return c;
+    }
+    return deadConn(dbName, "mongodb: could not reach a usable node (" + lastErr + ")");
 }
 
 pub struct MongoDriver impl Driver {
-    /// `dsn` is "host:port/db" (a minimal form; full mongodb:// URIs are a follow-up).
+    /// `dsn` is a mongodb:// URI: single host, a comma-separated seed list, credentials, and the
+    /// replicaSet / readPreference / tls query options. The connect runs SDAM discovery and returns a
+    /// connection to the read-preference target. mongodb+srv:// is recognised but not yet resolved.
     pub async fn connect(self, dsn: string): Connection {
         return await mongoConnectAsync(dsn);   // sync trait method drives the async connect once
     }
