@@ -19,6 +19,7 @@ import list;
 import serde.bson;
 import serde.source;   // ValueSink trait, for serde.dump<T> (DTO struct -> BSON on insert)
 import crypto.scram;
+import crypto.hash.md5;
 import crypto.random;
 import net.aio;
 import net.asynctls;
@@ -250,18 +251,33 @@ pub struct MongoConnection impl Connection {
         return wiremessage.decodeOpMsg(await readFrame(self.io));
     }
 
-    pub async fn authenticate(self: MongoConnection, username: string, password: string, clientNonce: string): bool {
-        let c = scram.ScramClient{ username: username, password: password, clientNonce: clientNonce };
-        let start = await self.runCommand(operation.saslStartCommand(self.dbName, c.clientFirstMessage()));
+    pub async fn authenticate(self: MongoConnection, username: string, password: string, clientNonce: string, sha1: bool): bool {
+        // MongoDB quirk: SCRAM-SHA-1 uses the MONGODB-CR password digest hex(md5(user:mongo:pass)) as the
+        // SCRAM password, NOT the raw password (SCRAM-SHA-256 uses the raw password, SASLprep'd).
+        let scramPass = if (sha1) md5.md5(username + ":mongo:" + password) else password;
+        let c = scram.ScramClient{ username: username, password: scramPass, clientNonce: clientNonce };
+        let mechanism = if (sha1) "SCRAM-SHA-1" else "SCRAM-SHA-256";
+        let start = await self.runCommand(operation.saslStartCommand(self.dbName, mechanism, c.clientFirstMessage()));
         let convIdx = bson.docFind(start, "conversationId");
         let payloadIdx = bson.docFind(start, "payload");
         if (convIdx < 0 || payloadIdx < 0) { return false; }
         let conversationId = bson.docGetInt(start, convIdx);
         let serverFirst = bson.docGetBinary(start, payloadIdx);
-        let clientFinal = c.clientFinalMessage(serverFirst);
+        let clientFinal = if (sha1) c.clientFinalMessageSha1(serverFirst) else c.clientFinalMessage(serverFirst);
         let cont = await self.runCommand(operation.saslContinueCommand(self.dbName, conversationId, clientFinal));
-        let doneIdx = bson.docFind(cont, "done");
-        return doneIdx >= 0 && bson.docGetBool(cont, doneIdx) != 0;
+        // SCRAM completes over a variable number of rounds: after the client proof the server returns its
+        // signature (v=...) with done:false, and expects a FINAL empty saslContinue before it reports
+        // done:true. Loop until done (or an error), sending an empty payload to finalize. This handles both
+        // the 2-step (server sets done on the proof reply) and 3-step flows.
+        let guard = 0;
+        while (guard < 4) {
+            if (bson.docFind(cont, "errmsg") >= 0) { return false; }
+            let doneIdx = bson.docFind(cont, "done");
+            if (doneIdx >= 0 && bson.docGetBool(cont, doneIdx) != 0) { return true; }
+            cont = await self.runCommand(operation.saslContinueCommand(self.dbName, conversationId, ""));
+            guard = guard + 1;
+        }
+        return false;
     }
 
     // MONGODB-X509 auth: the client certificate presented during the TLS handshake is the credential, so
@@ -472,15 +488,16 @@ async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: 
 }
 
 // Authenticate an already-connected + hello'd connection. X.509 uses the TLS client cert (no password);
-// otherwise SCRAM-SHA-256 runs when a user is present (nonce from the CSPRNG, never reused).
-async fn finishAuth(conn: MongoConnection, user: string, pass: string, x509: bool): MongoConnection {
+// otherwise SCRAM runs when a user is present -- SHA-256 by default, SHA-1 when requested (both nonce
+// from the CSPRNG, never reused).
+async fn finishAuth(conn: MongoConnection, user: string, pass: string, x509: bool, sha1: bool): MongoConnection {
     if (x509) {
         let okx = await conn.authenticateX509(user);
         if (!okx) { conn.markFailed("mongodb: X.509 authentication failed"); }
         return conn;
     }
     if (user != "") {
-        let ok = await conn.authenticate(user, pass, random.randomHex(18));
+        let ok = await conn.authenticate(user, pass, random.randomHex(18), sha1);
         if (!ok) { conn.markFailed("mongodb: authentication failed for user '" + user + "'"); }
     }
     return conn;
@@ -523,7 +540,9 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
     let caPem = if (verify && caFile != "") File.readText(caFile) else "";
     // MONGODB-X509: authMechanism + a client certificate/key PEM (tlsCertificateKeyFile carries both). A
     // client cert implies TLS. When x509 is set, auth uses the cert instead of SCRAM (no password needed).
-    let isX509 = string.eql(dsnParam(dsn, "authMechanism", ""), "MONGODB-X509");
+    let authMech = dsnParam(dsn, "authMechanism", "");
+    let isX509 = string.eql(authMech, "MONGODB-X509");
+    let isSha1 = string.eql(authMech, "SCRAM-SHA-1");
     let certFile = dsnParam(dsn, "tlsCertificateKeyFile", "");
     let clientPem = if (certFile != "") File.readText(certFile) else "";
     if (clientPem != "") { useTls = true; }
@@ -590,7 +609,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         let target = selectTarget(primary, info.hosts, readPref);
         // If the reachable seed already IS the target node, reuse its connection instead of dialling again.
         if (info.ok && string.eql(target, seed) && info.isPrimary) {
-            let c = await finishAuth(probe, user, pass, isX509);
+            let c = await finishAuth(probe, user, pass, isX509, isSha1);
             c.setTopology(info.setName, seed, info.hosts);
             c.retryWrites = retryWrites;
             c.dsn = dsn;
@@ -610,7 +629,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
             lastErr = "target " + target + " is not primary yet (election in progress?)";
             continue;
         }
-        let c = await finishAuth(tconn, user, pass, isX509);
+        let c = await finishAuth(tconn, user, pass, isX509, isSha1);
         c.setTopology(tinfo.setName, target, tinfo.hosts);
         c.retryWrites = retryWrites;
         c.dsn = dsn;
