@@ -85,6 +85,94 @@ pub fn killCursorsCommand(dbName: string, coll: string, cursorId: long): bson.Bs
     return d;
 }
 
+// Build a BSON array document ("0","1",...) from a list of documents.
+fn docArray(docs: List<bson.BsonDocument>): ptr {
+    let arr = newDoc();
+    let i = 0;
+    while (i < docs.size()) { arr.entries.push(bson.entryDoc(`${i}`, bson.serialize(docs.get(i) ?? newDoc()))); i = i + 1; }
+    return bson.serialize(arr);
+}
+// Wrap a single sub-document as a one-element BSON array.
+fn oneDocArray(d: bson.BsonDocument): ptr {
+    let arr = newDoc();
+    arr.entries.push(bson.entryDoc("0", bson.serialize(d)));
+    return bson.serialize(arr);
+}
+
+/// { insert: <coll>, documents: [<doc>...], ordered: true, $db } — one or more documents.
+pub fn insertManyCommand(dbName: string, coll: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("insert", coll));
+    d.entries.push(bson.entryArray("documents", docArray(docs)));
+    d.entries.push(bson.entryBool("ordered", 1));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { update: <coll>, updates: [{ q, u, upsert, multi }], $db }.
+pub fn updateCommand(dbName: string, coll: string, filter: bson.BsonDocument, updateDoc: bson.BsonDocument,
+                     upsert: bool, multi: bool): bson.BsonDocument {
+    let u = newDoc();
+    u.entries.push(bson.entryDoc("q", bson.serialize(filter)));
+    u.entries.push(bson.entryDoc("u", bson.serialize(updateDoc)));
+    u.entries.push(bson.entryBool("upsert", if (upsert) 1 else 0));
+    u.entries.push(bson.entryBool("multi", if (multi) 1 else 0));
+    let d = newDoc();
+    d.entries.push(bson.entryString("update", coll));
+    d.entries.push(bson.entryArray("updates", oneDocArray(u)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { delete: <coll>, deletes: [{ q, limit }], $db }. limit 1 = one, 0 = all.
+pub fn deleteCommand(dbName: string, coll: string, filter: bson.BsonDocument, limit: int): bson.BsonDocument {
+    let del = newDoc();
+    del.entries.push(bson.entryDoc("q", bson.serialize(filter)));
+    del.entries.push(bson.entryInt("limit", limit));
+    let d = newDoc();
+    d.entries.push(bson.entryString("delete", coll));
+    d.entries.push(bson.entryArray("deletes", oneDocArray(del)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { findAndModify: <coll>, query, update, new, upsert, $db } — returns the pre- or post-image.
+pub fn findAndModifyCommand(dbName: string, coll: string, filter: bson.BsonDocument, updateDoc: bson.BsonDocument,
+                            returnNew: bool, upsert: bool): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("findAndModify", coll));
+    d.entries.push(bson.entryDoc("query", bson.serialize(filter)));
+    d.entries.push(bson.entryDoc("update", bson.serialize(updateDoc)));
+    d.entries.push(bson.entryBool("new", if (returnNew) 1 else 0));
+    d.entries.push(bson.entryBool("upsert", if (upsert) 1 else 0));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+// Map a MongoDB error code onto the normalized db.DBERR_* taxonomy.
+pub fn classifyMongoErr(code: int): int {
+    if (code == 11000 || code == 11001) { return db.DBERR_UNIQUE_VIOLATION; }  // duplicate key
+    if (code == 121) { return db.DBERR_CHECK; }                                // document validation
+    if (code == 50) { return db.DBERR_LOCK_TIMEOUT; }                          // MaxTimeMSExpired
+    if (code == 13 || code == 18) { return db.DBERR_AUTH; }                    // Unauthorized / AuthFailed
+    return db.DBERR_UNKNOWN;
+}
+
+// The first per-document write error (writeErrors: [{index, code, errmsg}]) from a write reply,
+// classified onto DBERR_*. Falls back to the command-level error when there is no writeErrors array.
+pub fn writeError(reply: bson.BsonDocument): DbError {
+    let weIdx = bson.docFind(reply, "writeErrors");
+    if (weIdx < 0) { return commandError(reply); }
+    let arr = bson.deserialize(bson.docGetArray(reply, weIdx) as ptr);
+    if (arr.entries.size() == 0) { return commandError(reply); }
+    let e0 = bson.deserialize(bson.docGetDoc(arr, 0) as ptr);
+    let cIdx = bson.docFind(e0, "code");
+    let mIdx = bson.docFind(e0, "errmsg");
+    let code = if (cIdx >= 0) bson.docGetInt(e0, cIdx) else 0;
+    let msg = if (mIdx >= 0) bson.docGetString(e0, mIdx) else "write error";
+    return DbError(`${code}`, msg).with(code, classifyMongoErr(code));
+}
+
 /// { saslStart: 1, mechanism: "SCRAM-SHA-256", payload: <bin>, $db: <db> }.
 pub fn saslStartCommand(dbName: string, clientFirst: string): bson.BsonDocument {
     let d = newDoc();
@@ -112,6 +200,6 @@ pub fn commandError(reply: bson.BsonDocument): DbError {
     if (emIdx < 0) { return noError(); }
     let msg = bson.docGetString(reply, emIdx);
     let codeIdx = bson.docFind(reply, "code");
-    let code = if (codeIdx >= 0) `${bson.docGetInt(reply, codeIdx)}` else "";
-    return DbError(code, msg);
+    let codeN = if (codeIdx >= 0) bson.docGetInt(reply, codeIdx) else 0;
+    return DbError(`${codeN}`, msg).with(codeN, classifyMongoErr(codeN));
 }

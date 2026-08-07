@@ -150,3 +150,31 @@ pub struct FindOptions {
 }
 
 pub fn findOptions(): FindOptions { return FindOptions(); }
+
+// --- Update: a fluent update builder lowering to { $set:{...}, $inc:{...}, $unset:{...} } ---------
+
+pub struct Update {
+    pub setDoc: bson.BsonDocument,     // $set fields
+    pub incDoc: bson.BsonDocument,     // $inc fields
+    pub unsetDoc: bson.BsonDocument,   // $unset fields
+    init() {
+        self.setDoc = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        self.incDoc = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        self.unsetDoc = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    }
+    pub fn setStr(self: Update, field: string, v: string): Update { self.setDoc.entries.push(bson.entryString(field, v)); return self; }
+    pub fn setInt(self: Update, field: string, v: long): Update { self.setDoc.entries.push(bson.entryInt64Val(field, v)); return self; }
+    pub fn setDouble(self: Update, field: string, v: double): Update { self.setDoc.entries.push(bson.entryDoubleVal(field, v)); return self; }
+    pub fn setBool(self: Update, field: string, v: bool): Update { self.setDoc.entries.push(bson.entryBool(field, if (v) 1 else 0)); return self; }
+    pub fn incInt(self: Update, field: string, v: long): Update { self.incDoc.entries.push(bson.entryInt64Val(field, v)); return self; }
+    pub fn unset(self: Update, field: string): Update { self.unsetDoc.entries.push(bson.entryString(field, "")); return self; }
+    pub fn toBson(self: Update): bson.BsonDocument {
+        let d = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        if (self.setDoc.entries.size() > 0) { d.entries.push(bson.entryDoc("$set", bson.serialize(self.setDoc))); }
+        if (self.incDoc.entries.size() > 0) { d.entries.push(bson.entryDoc("$inc", bson.serialize(self.incDoc))); }
+        if (self.unsetDoc.entries.size() > 0) { d.entries.push(bson.entryDoc("$unset", bson.serialize(self.unsetDoc))); }
+        return d;
+    }
+}
+
+pub fn update(): Update { return Update(); }

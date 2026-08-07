@@ -370,6 +370,88 @@ pub struct Collection {
     }
     // Whole-collection convenience: find(all()).
     pub async fn findAll(self: Collection): Cursor { return await self.find(document.all(), document.findOptions()); }
+
+    // -- writes (P3) --
+
+    pub async fn insertOne(self: Collection, d: document.Doc): InsertResult {
+        let docs = List<document.Doc>();
+        docs.push(d);
+        return await self.insertMany(docs);
+    }
+    // Insert one or more documents. Any document without an `_id` gets a client-generated ObjectId
+    // (returned in insertedIds), matching official-driver behaviour so you can read/query it back.
+    pub async fn insertMany(self: Collection, docs: List<document.Doc>): InsertResult {
+        let res = InsertResult();
+        let bdocs = List<bson.BsonDocument>();
+        let i = 0;
+        while (i < docs.size()) {
+            let d = docs.get(i) ?? document.doc();
+            if (!d.has("_id")) {
+                let oid = newObjectId();
+                let _ = d.setObjectId("_id", oid);
+                res.insertedIds.push(oid);
+            } else {
+                let x = d.getObjectId("_id");
+                if (x != undefined) { res.insertedIds.push(x); }
+            }
+            bdocs.push(d.bson);
+            i = i + 1;
+        }
+        let reply = await self.conn.runCommand(commands.insertManyCommand(self.dbName, self.coll, bdocs));
+        let e = commands.writeError(reply);
+        if (!e.isEmpty()) { res.err = e; return res; }
+        res.insertedCount = numAt(reply, "n");
+        return res;
+    }
+
+    pub async fn updateOne(self: Collection, f: document.Filter, u: document.Update, upsert: bool): UpdateResult {
+        return await self.doUpdate(f, u.toBson(), upsert, false);
+    }
+    pub async fn updateMany(self: Collection, f: document.Filter, u: document.Update): UpdateResult {
+        return await self.doUpdate(f, u.toBson(), false, true);
+    }
+    // Replace the whole matched document (the replacement is a plain doc, no update operators).
+    pub async fn replaceOne(self: Collection, f: document.Filter, replacement: document.Doc, upsert: bool): UpdateResult {
+        return await self.doUpdate(f, replacement.bson, upsert, false);
+    }
+    async fn doUpdate(self: Collection, f: document.Filter, updateBson: bson.BsonDocument, upsert: bool, multi: bool): UpdateResult {
+        let res = UpdateResult();
+        let reply = await self.conn.runCommand(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi));
+        let e = commands.writeError(reply);
+        if (!e.isEmpty()) { res.err = e; return res; }
+        res.matched = numAt(reply, "n");
+        res.modified = numAt(reply, "nModified");
+        let uIdx = bson.docFind(reply, "upserted");
+        if (uIdx >= 0) {
+            let arr = bson.deserialize(bson.docGetArray(reply, uIdx) as ptr);
+            if (arr.entries.size() > 0) {
+                let e0 = bson.deserialize(bson.docGetDoc(arr, 0) as ptr);
+                let idIdx = bson.docFind(e0, "_id");
+                if (idIdx >= 0 && bson.docGetType(e0, idIdx) == 7) { res.upsertedId = bson.docGetObjectId(e0, idIdx); }
+            }
+        }
+        return res;
+    }
+
+    pub async fn deleteOne(self: Collection, f: document.Filter): DeleteResult { return await self.doDelete(f, 1); }
+    pub async fn deleteMany(self: Collection, f: document.Filter): DeleteResult { return await self.doDelete(f, 0); }
+    async fn doDelete(self: Collection, f: document.Filter, limit: int): DeleteResult {
+        let res = DeleteResult();
+        let reply = await self.conn.runCommand(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit));
+        let e = commands.writeError(reply);
+        if (!e.isEmpty()) { res.err = e; return res; }
+        res.deletedCount = numAt(reply, "n");
+        return res;
+    }
+
+    // Atomically update the first match and return the pre- or post-image (returnNew), or undefined
+    // if nothing matched (and no upsert).
+    pub async fn findOneAndUpdate(self: Collection, f: document.Filter, u: document.Update, returnNew: bool, upsert: bool): document.Doc | undefined {
+        let reply = await self.conn.runCommand(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert));
+        let vIdx = bson.docFind(reply, "value");
+        if (vIdx < 0 || bson.docGetType(reply, vIdx) != 3) { return undefined; }   // absent / null (type 10)
+        return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
+    }
 }
 
 pub struct Database {
@@ -390,3 +472,42 @@ pub fn filter(): document.Filter { return document.filter(); }
 pub fn all(): document.Filter { return document.all(); }
 pub fn doc(): document.Doc { return document.doc(); }
 pub fn findOptions(): document.FindOptions { return document.findOptions(); }
+pub fn update(): document.Update { return document.update(); }
+
+// --- write results + helpers (P3) ---------------------------------------------------------------
+
+pub struct InsertResult {
+    pub insertedCount: long,
+    pub insertedIds: List<string>,   // hex ObjectIds (client-generated when the doc had no _id)
+    pub err: DbError,
+    init() { self.insertedCount = 0; self.insertedIds = List<string>(); self.err = db.noError(); }
+    pub fn ok(self: InsertResult): bool { return self.err.isEmpty(); }
+}
+pub struct UpdateResult {
+    pub matched: long,
+    pub modified: long,
+    pub upsertedId: string,          // hex ObjectId of an upsert, or "" if none
+    pub err: DbError,
+    init() { self.matched = 0; self.modified = 0; self.upsertedId = ""; self.err = db.noError(); }
+    pub fn ok(self: UpdateResult): bool { return self.err.isEmpty(); }
+}
+pub struct DeleteResult {
+    pub deletedCount: long,
+    pub err: DbError,
+    init() { self.deletedCount = 0; self.err = db.noError(); }
+    pub fn ok(self: DeleteResult): bool { return self.err.isEmpty(); }
+}
+
+// Generate a fresh 24-hex ObjectId (12 CSPRNG bytes -- valid + unique; the spec's time+counter layout
+// is not required for uniqueness).
+pub fn newObjectId(): string { return random.randomHex(12); }
+
+// Read a numeric reply field (n / nModified) whether the server encoded it as int32, int64 or double.
+fn numAt(reply: bson.BsonDocument, key: string): long {
+    let i = bson.docFind(reply, key);
+    if (i < 0) { return 0; }
+    let t = bson.docGetType(reply, i);
+    if (t == 16 || t == 18) { return bson.docGetInt64(reply, i); }
+    if (t == 1) { return bson.docGetDouble(reply, i) as long; }
+    return 0;
+}
