@@ -489,10 +489,11 @@ fn mongoConnectTimeoutMs(dsn: string): int {
 async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: string, clientPem: string, timeoutMs: int): aio.AsyncIO {
     if (useTls) {
         // A client certificate (MONGODB-X509 / tlsCertificateKeyFile) means mutual TLS: present it during
-        // the handshake. certPem == keyPem here (MongoDB ships both in one tlsCertificateKeyFile).
-        if (clientPem != "") { return await asynctls.tlsConnectClientCert(host, port, caPem, clientPem, clientPem); }
-        if (verify) { return await asynctls.tlsConnectVerify(host, port, caPem); }
-        return await asynctls.tlsConnect(host, port, false);
+        // the handshake. certPem == keyPem here (MongoDB ships both in one tlsCertificateKeyFile). The
+        // Deadline variants bound BOTH the TCP connect and the TLS handshake.
+        if (clientPem != "") { return await asynctls.tlsConnectClientCertDeadline(host, port, caPem, clientPem, clientPem, timeoutMs); }
+        if (verify) { return await asynctls.tlsConnectVerifyDeadline(host, port, caPem, timeoutMs); }
+        return await asynctls.tlsConnectDeadline(host, port, false, timeoutMs);
     }
     return await aio.asyncConnectDeadline(host, port, timeoutMs);
 }
