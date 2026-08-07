@@ -78,6 +78,10 @@ pub struct MongoConnection impl Connection {
     pub retryWrites: bool,       // honour retryable writes (default true; DSN retryWrites=false disables)
     pub implicitLsid: string,    // lazily created implicit-session lsid ("" until first retryable write)
     pub implicitTxn: long,       // monotonic txnNumber for the implicit session
+    // SDAM monitoring: the DSN (so the connection can re-discover) + this server's last-seen role.
+    pub dsn: string,             // the connection string, kept so a heartbeat can re-run discovery
+    pub serverType: string,      // RSPrimary / RSSecondary / RSOther / Standalone / Unknown
+    pub wantsPrimary: bool,      // read preference is primary(-preferred): a heartbeat must stay on the primary
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
@@ -92,6 +96,48 @@ pub struct MongoConnection impl Connection {
         self.retryWrites = true;
         self.implicitLsid = "";
         self.implicitTxn = 0;
+        self.dsn = "";
+        self.serverType = "Unknown";
+        self.wantsPrimary = true;
+    }
+    // SDAM: re-run discovery from the stored DSN and swap this connection over to the (possibly new)
+    // read-preference target -- the on-demand half of server monitoring, used when a heartbeat finds the
+    // primary has moved or a command reports we are no longer writable. Returns false if no node is usable.
+    pub async fn reconnect(self: MongoConnection): bool {
+        if (self.dsn == "") { return false; }
+        let fresh = await mongoConnectAsync(self.dsn);
+        if (fresh.failed) { return false; }
+        self.io = fresh.io;              // swap over to the newly selected node's stream
+        self.nextId = 1;
+        self.busy = false;
+        self.failed = false; self.failErr = "";
+        self.setName = fresh.setName; self.serverHost = fresh.serverHost; self.members = fresh.members;
+        self.serverType = fresh.serverType;
+        self.implicitLsid = "";          // the session belongs to the old server; get a fresh one
+        return true;
+    }
+    // SDAM heartbeat: run `hello`, refresh this server's role + the member list, and if we have LOST the
+    // primary (we are no longer writable but the server names a different primary), re-discover and
+    // reconnect to it. Returns true if the connection is healthy (or was healed) afterwards. This is the
+    // per-check step of server monitoring; a background timer that calls it on an interval is a follow-on
+    // (Nova has no async sleep primitive yet).
+    pub async fn heartbeat(self: MongoConnection): bool {
+        let info = parseHello(await self.runCommand(commands.helloCommand(self.dbName)));
+        if (!info.ok) { return await self.reconnect(); }   // unreachable -> try to re-discover
+        self.setName = info.setName;
+        self.members = info.hosts;
+        self.serverType = if (info.isPrimary) "RSPrimary"
+            else if (info.setName != "" && info.primary != "") "RSSecondary"
+            else if (info.setName != "") "RSOther"
+            else "Standalone";
+        // If we need a primary but this node is no longer one (stepped down / secondary), re-discover from
+        // ALL seeds and follow the new primary. We reconnect even when this node cannot yet name the new
+        // primary (mid-election, primary == ""), because discovery queries the peers directly; reconnect
+        // returns false until an election settles, so the caller keeps retrying.
+        if (self.wantsPrimary && !info.isPrimary && info.setName != "") {
+            return await self.reconnect();
+        }
+        return true;
     }
     // Lazily create the implicit session used to tag retryable writes (once per connection). Reuses the
     // server-assigned lsid, trimmed to its declared BSON length (see trimBsonDoc / lsidEntry).
@@ -466,15 +512,29 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
             let c = await finishAuth(probe, user, pass);
             c.setTopology(info.setName, seed, info.hosts);
             c.retryWrites = retryWrites;
+            c.dsn = dsn;
+            c.serverType = if (info.setName != "") "RSPrimary" else "Standalone";
+            c.wantsPrimary = readPref == RP_PRIMARY || readPref == RP_PRIMARY_PREFERRED;
             return c;
         }
         let thp = splitHostPort(target);
         let tconn = MongoConnection(await openStream(thp.host, thp.port, useTls, verify, caPem), dbName);
         let tinfo = parseHello(await tconn.runCommand(commands.helloCommand(dbName)));
         if (!tinfo.ok) { lastErr = "read-preference target " + target + " unreachable"; continue; }
+        // Verify the target actually satisfies the read preference. A seed's `primary` field can be STALE
+        // during a failover (it names the node that just stepped down), so a primary-seeking connect must
+        // confirm the target is really primary -- otherwise we would pin to a stale primary. Rejecting it
+        // lets the caller (discovery loop / reconnect retry) find the node that won the election.
+        if ((readPref == RP_PRIMARY || readPref == RP_PRIMARY_PREFERRED) && !tinfo.isPrimary) {
+            lastErr = "target " + target + " is not primary yet (election in progress?)";
+            continue;
+        }
         let c = await finishAuth(tconn, user, pass);
         c.setTopology(tinfo.setName, target, tinfo.hosts);
         c.retryWrites = retryWrites;
+        c.dsn = dsn;
+        c.serverType = if (tinfo.isPrimary) "RSPrimary" else if (tinfo.setName != "") "RSSecondary" else "Standalone";
+        c.wantsPrimary = readPref == RP_PRIMARY || readPref == RP_PRIMARY_PREFERRED;
         return c;
     }
     return deadConn(dbName, "mongodb: could not reach a usable node (" + lastErr + ")");
