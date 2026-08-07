@@ -1,0 +1,202 @@
+// srv — a minimal DNS SRV/TXT resolver for `mongodb+srv://` connection strings (SRP: DNS only, no wire
+// or Mongo knowledge). A `mongodb+srv://host/db` URI carries a single host whose `_mongodb._tcp.<host>`
+// SRV records expand to the replica-set seed list, and whose `<host>` TXT record may carry extra options
+// (replicaSet / authSource). This does a ONE-SHOT blocking UDP query at connect time (like the official
+// drivers), bounded by a socket timeout, so a slow resolver cannot hang the caller indefinitely.
+//
+// The resolver address is the first `nameserver` in /etc/resolv.conf (falling back to 8.8.8.8:53), or an
+// explicit override via the NOVA_MONGO_DNS env var ("ip" or "ip:port") -- handy for a self-hosted /
+// test resolver. IPv6 nameservers and DNSSEC are out of scope.
+import bytes;
+import string;
+import list;
+import io.file;
+import os.socket;
+import os.sys;
+import platform;
+import env;
+
+pub struct SrvResult {
+    pub ok: bool,
+    pub hosts: List<string>,   // resolved seeds (host:port) from the SRV records
+    pub options: string,       // raw TXT string (e.g. "replicaSet=rs0&authSource=admin"), "" if none
+    pub err: string,
+    init() { self.ok = false; self.hosts = List<string>(); self.options = ""; self.err = ""; }
+}
+
+// A DNS name parsed out of a message, plus the offset of the byte AFTER the name in the original stream
+// (so the caller keeps walking the record even when the name used a compression pointer).
+struct NameRes { pub name: string, pub next: int, init(name: string, next: int) { self.name = name; self.next = next; } }
+
+// The raw UDP response buffer + its length (len == 0 means the query failed). `err` names the failing step.
+struct QueryOut { pub buf: ptr, pub len: int, pub ok: bool, pub err: string, init(buf: ptr, len: int, ok: bool, err: string) { self.buf = buf; self.len = len; self.ok = ok; self.err = err; } }
+
+fn u16(buf: ptr, pos: int): int { return ((bytes.read_byte(buf, pos) & 255) << 8) | (bytes.read_byte(buf, pos + 1) & 255); }
+
+// Parse a DNS name at `start`, following compression pointers (0xC0). Returns the name (dot-joined, no
+// trailing dot) and the stream offset just past the name as it appears at `start`.
+fn readName(buf: ptr, start: int): NameRes {
+    let nameBuf = bytes.alloc(256);
+    let nlen = 0;
+    let pos = start;
+    let jumped = false;
+    let next = start;
+    let guard = 0;
+    while (guard < 128) {
+        guard = guard + 1;
+        let b = bytes.read_byte(buf, pos) & 255;
+        if (b == 0) { pos = pos + 1; if (!jumped) { next = pos; } break; }
+        if ((b & 192) == 192) {                       // compression pointer
+            let offset = ((b & 63) << 8) | (bytes.read_byte(buf, pos + 1) & 255);
+            if (!jumped) { next = pos + 2; }
+            jumped = true;
+            pos = offset;
+        } else {                                       // a label
+            let len = b;
+            pos = pos + 1;
+            if (nlen > 0 && nlen < 250) { bytes.write_byte(nameBuf, nlen, 46); nlen = nlen + 1; }  // '.'
+            let j = 0;
+            while (j < len && nlen < 250) { bytes.write_byte(nameBuf, nlen, bytes.read_byte(buf, pos + j) & 255); nlen = nlen + 1; j = j + 1; }
+            pos = pos + len;
+        }
+    }
+    return NameRes(string.slice(nameBuf as string, 0, nlen), next);
+}
+
+// Write a standard-query packet (RD set) for `name`/`qtype` into `buf`; returns the byte length.
+fn writeQuery(buf: ptr, name: string, qtype: int, id: int): int {
+    bytes.write_byte(buf, 0, (id >> 8) & 255); bytes.write_byte(buf, 1, id & 255);
+    bytes.write_byte(buf, 2, 1); bytes.write_byte(buf, 3, 0);     // flags 0x0100 (RD)
+    bytes.write_byte(buf, 4, 0); bytes.write_byte(buf, 5, 1);     // QDCOUNT = 1
+    bytes.write_byte(buf, 6, 0); bytes.write_byte(buf, 7, 0);     // ANCOUNT
+    bytes.write_byte(buf, 8, 0); bytes.write_byte(buf, 9, 0);     // NSCOUNT
+    bytes.write_byte(buf, 10, 0); bytes.write_byte(buf, 11, 0);   // ARCOUNT
+    let pos = 12;
+    let labels = string.split(name, ".");
+    let i = 0;
+    while (i < labels.size()) {
+        let lab = labels.get(i) ?? "";
+        i = i + 1;
+        if (lab == "") { continue; }
+        bytes.write_byte(buf, pos, lab.length & 255); pos = pos + 1;
+        let j = 0;
+        while (j < lab.length) { bytes.write_byte(buf, pos, lab[j] & 255); pos = pos + 1; j = j + 1; }
+    }
+    bytes.write_byte(buf, pos, 0); pos = pos + 1;                 // root label
+    bytes.write_byte(buf, pos, (qtype >> 8) & 255); pos = pos + 1;
+    bytes.write_byte(buf, pos, qtype & 255); pos = pos + 1;
+    bytes.write_byte(buf, pos, 0); pos = pos + 1;                 // QCLASS hi
+    bytes.write_byte(buf, pos, 1); pos = pos + 1;                 // QCLASS lo (IN)
+    return pos;
+}
+
+// The resolver "ip:port": NOVA_MONGO_DNS override, else the first resolv.conf nameserver, else 8.8.8.8:53.
+fn dnsServer(): string {
+    let ov = string.trim(env.get("NOVA_MONGO_DNS"));
+    if (ov != "") { return if (string.indexOf(ov, ":") >= 0) ov else ov + ":53"; }
+    let rc = File.readText("/etc/resolv.conf");
+    let lines = string.split(rc, "\n");
+    let i = 0;
+    while (i < lines.size()) {
+        let ln = string.trim(lines.get(i) ?? "");
+        i = i + 1;
+        if (string.indexOf(ln, "nameserver ") == 0) {
+            let ip = string.trim(string.slice(ln, 11, ln.length));
+            if (ip != "") { return ip + ":53"; }
+        }
+    }
+    return "8.8.8.8:53";
+}
+
+// One blocking UDP query to `server` ("ip:port"); returns the raw response bytes.
+fn query(server: string, name: string, qtype: int): QueryOut {
+    let colon = string.lastIndexOf(server, ":");
+    let ip = if (colon >= 0) string.slice(server, 0, colon) else server;
+    let port = if (colon >= 0) string.parseI64(string.slice(server, colon + 1, server.length)) as int else 53;
+    let fd = socket.newUdp();
+    if (fd < 0) { return QueryOut(bytes.alloc(1), 0, false, "newUdp fd=" + `${fd}`); }
+    let addrBE = socket.resolveHost4(ip);
+    if (addrBE == (0 - 1)) { let _ = socket.close(fd); return QueryOut(bytes.alloc(1), 0, false, "resolveHost4('" + ip + "') failed"); }
+    let sa = socket.makeSockaddrIn(port, addrBE);
+    // makeSockaddrIn writes the Linux layout (2-byte sin_family at offset 0). A BSD sockaddr_in wants
+    // sin_len at byte 0 and sin_family at byte 1, so on macOS/BSD a blocking connect() reads family 0
+    // (AF_UNSPEC) and fails EAFNOSUPPORT. Patch the BSD header for the datagram connect.
+    if (!platform.isLinux) { bytes.write_byte(sa, 0, 16); bytes.write_byte(sa, 1, 2); }
+    let cr = socket.connectSock(fd, sa, 16);
+    if (cr != 0) { let en = sys.errno(); let _ = socket.close(fd); return QueryOut(bytes.alloc(1), 0, false, "connect " + ip + ":" + `${port}` + " fd=" + `${fd}` + " rc=" + `${cr}` + " errno=" + `${en}`); }
+    let _t = socket.setTimeout(fd, 3000);
+    let qbuf = bytes.alloc(512);
+    let qlen = writeQuery(qbuf, name, qtype, 4660);   // id 0x1234
+    let sent = socket.sendSock(fd, qbuf as long, qlen);
+    if (sent < qlen) { let _ = socket.close(fd); return QueryOut(bytes.alloc(1), 0, false, "send rc=" + `${sent}` + " of " + `${qlen}`); }
+    let rbuf = bytes.alloc(4096);
+    let n = socket.recvSock(fd, rbuf as long, 4096);
+    let _c = socket.close(fd);
+    if (n < 12) { return QueryOut(rbuf, 0, false, "recv rc=" + `${n}`); }
+    return QueryOut(rbuf, n as int, true, "");
+}
+
+// Walk the answer section, invoking on each SRV record: collect "target:port" into `out`.
+fn parseSrv(buf: ptr, out: List<string>): void {
+    let ancount = u16(buf, 6);
+    let pos = readName(buf, 12).next + 4;             // skip the question (name + qtype + qclass)
+    let a = 0;
+    while (a < ancount) {
+        a = a + 1;
+        let pos2 = readName(buf, pos).next;           // record NAME
+        let atype = u16(buf, pos2);
+        let rdlen = u16(buf, pos2 + 8);               // after type(2) class(2) ttl(4)
+        let rdstart = pos2 + 10;
+        if (atype == 33) {                            // SRV: priority(2) weight(2) port(2) target
+            let port = u16(buf, rdstart + 4);
+            let target = readName(buf, rdstart + 6).name;
+            if (target != "") { out.push(target + ":" + `${port}`); }
+        }
+        pos = rdstart + rdlen;
+    }
+}
+
+// First TXT record's concatenated string ("" if none).
+fn parseTxt(buf: ptr): string {
+    let ancount = u16(buf, 6);
+    let pos = readName(buf, 12).next + 4;
+    let a = 0;
+    while (a < ancount) {
+        a = a + 1;
+        let pos2 = readName(buf, pos).next;
+        let atype = u16(buf, pos2);
+        let rdlen = u16(buf, pos2 + 8);
+        let rdstart = pos2 + 10;
+        if (atype == 16) {                            // TXT: one or more <len><bytes> segments
+            let p = rdstart;
+            let end = rdstart + rdlen;
+            let out = "";
+            while (p < end) {
+                let seglen = bytes.read_byte(buf, p) & 255;
+                p = p + 1;
+                let segbuf = bytes.alloc(if (seglen > 0) seglen else 1);
+                let j = 0;
+                while (j < seglen) { bytes.write_byte(segbuf, j, bytes.read_byte(buf, p + j) & 255); j = j + 1; }
+                out = out + string.slice(segbuf as string, 0, seglen);
+                p = p + seglen;
+            }
+            return out;
+        }
+        pos = rdstart + rdlen;
+    }
+    return "";
+}
+
+// Resolve a mongodb+srv host: SRV `_mongodb._tcp.<host>` -> seeds, TXT `<host>` -> options.
+pub fn resolve(host: string): SrvResult {
+    let r = SrvResult();
+    let server = dnsServer();
+    let sq = query(server, "_mongodb._tcp." + host, 33);
+    if (!sq.ok) { r.err = "SRV query via " + server + ": " + sq.err; return r; }
+    parseSrv(sq.buf, r.hosts);
+    if (r.hosts.size() == 0) { r.err = "no _mongodb._tcp." + host + " SRV records"; return r; }
+    let tq = query(server, host, 16);
+    if (tq.ok) { r.options = parseTxt(tq.buf); }
+    r.ok = true;
+    return r;
+}

@@ -25,6 +25,7 @@ import db;
 import codec;
 import commands;
 import document;
+import srv;
 
 // ---------------------------------------------------------------------------
 // Live socket framing
@@ -128,8 +129,16 @@ pub struct MongoConnection impl Connection {
         return Session(self, trimBsonDoc(lsid));
     }
 
-    // Send one OP_MSG command and await the reply (the recv parks the coroutine).
+    // Send one OP_MSG command and await the reply (the recv parks the coroutine). A failed connection
+    // (discovery/auth failure, e.g. a deadConn over a fd -1 stream) returns an empty reply carrying the
+    // failure reason -- sending on its dead stream would hit the removed Asio path and abort the process.
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
+        if (self.failed) {
+            let e = commands.newDoc();
+            e.entries.push(bson.entryDouble("ok", 0, 0));
+            e.entries.push(bson.entryString("errmsg", self.failErr));
+            return e;
+        }
         let id = self.nextId;
         self.nextId = id + 1;
         let frame = codec.encodeOpMsg(id, command);
@@ -249,6 +258,19 @@ fn trimBsonDoc(s: string): string {
     let k = 0;
     while (k < n) { bytes.write_byte(buf, k, s[k] & 255); k = k + 1; }
     return buf as string;
+}
+
+// Extract `key`'s value from an SRV TXT options string ("replicaSet=rs0&authSource=admin"); "" if absent.
+fn txtOption(opts: string, key: string): string {
+    let parts = string.split(opts, "&");
+    let i = 0;
+    while (i < parts.size()) {
+        let p = string.trim(parts.get(i) ?? "");
+        i = i + 1;
+        let eq = string.indexOf(p, "=");
+        if (eq > 0 && string.eql(string.slice(p, 0, eq), key)) { return string.slice(p, eq + 1, p.length); }
+    }
+    return "";
 }
 
 fn dsnParam(dsn: string, key: string, dflt: string): string {
@@ -407,12 +429,17 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
     let dbName0 = if (slash >= 0) string.slice(base, slash + 1, base.length) else "test";
     let dbName = if (dbName0 != "") dbName0 else "test";
 
+    // Seeds come from the host section, EXCEPT for mongodb+srv:// where they are the SRV records of the
+    // single host. srv:// also implies TLS (unless tls= is set) and may pull replicaSet from a TXT record.
+    let seeds = string.split(hostSection, ",");
     if (isSrv) {
-        return deadConn(dbName, "mongodb+srv:// (DNS SRV) is not yet supported; use the seed-list form "
-            + "mongodb://host1:port1,host2:port2/db?replicaSet=NAME");
+        let sr = srv.resolve(hostSection);
+        if (!sr.ok) { return deadConn(dbName, "mongodb+srv:// resolution failed: " + sr.err); }
+        seeds = sr.hosts;
+        if (string.eql(dsnParam(dsn, "tls", ""), "")) { useTls = true; }   // srv:// defaults to TLS
+        if (string.eql(replicaSet, "")) { replicaSet = txtOption(sr.options, "replicaSet"); }
     }
 
-    let seeds = string.split(hostSection, ",");
     let lastErr = "no seeds in DSN";
     let i = 0;
     while (i < seeds.size()) {
