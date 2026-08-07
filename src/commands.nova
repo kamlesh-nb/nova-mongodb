@@ -128,6 +128,16 @@ pub fn bulkUpdateCommand(dbName: string, coll: string, specs: List<bson.BsonDocu
     d.entries.push(bson.entryString("$db", dbName));
     return d;
 }
+/// The insert command BODY only (no `documents` array) -- the documents ride in a kind-1 OP_MSG
+/// document sequence (codec.encodeOpMsgSeq). Wire-efficient for bulk: no array nested in the command.
+pub fn insertBodyCommand(dbName: string, coll: string, ordered: bool): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("insert", coll));
+    d.entries.push(bson.entryBool("ordered", if (ordered) 1 else 0));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
 pub fn bulkDeleteCommand(dbName: string, coll: string, specs: List<bson.BsonDocument>, ordered: bool): bson.BsonDocument {
     let d = newDoc();
     d.entries.push(bson.entryString("delete", coll));

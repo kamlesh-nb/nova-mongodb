@@ -183,6 +183,29 @@ pub struct MongoConnection impl Connection {
         if (!await self.reconnect()) { return reply; }   // no new primary yet -> surface the original error
         return await self.runCommand(command);            // retry once on the new primary
     }
+    // Send a command whose bulk payload rides in a KIND-1 OP_MSG document sequence (codec.encodeOpMsgSeq)
+    // rather than an array in the body -- the wire-efficient form for bulk writes. Same failed-guard as
+    // runCommand.
+    pub async fn runCommandSeq(self: MongoConnection, command: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
+        if (self.failed) {
+            let e = commands.newDoc();
+            e.entries.push(bson.entryDouble("ok", 0, 0));
+            e.entries.push(bson.entryString("errmsg", self.failErr));
+            return e;
+        }
+        let id = self.nextId;
+        self.nextId = id + 1;
+        let frame = codec.encodeOpMsgSeq(id, command, seqId, docs);
+        let dummy = await self.io.sendStr(frame);
+        return codec.decodeOpMsg(await readFrame(self.io));
+    }
+    pub async fn runCommandSeqFailover(self: MongoConnection, command: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>): bson.BsonDocument {
+        let reply = await self.runCommandSeq(command, seqId, docs);
+        if (!self.wantsPrimary) { return reply; }
+        if (!isNotPrimaryReply(reply)) { return reply; }
+        if (!await self.reconnect()) { return reply; }
+        return await self.runCommandSeq(command, seqId, docs);
+    }
     // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
     // instead of pretending to be live (auth used to be checked-but-ignored).
     pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
@@ -756,6 +779,39 @@ pub struct Collection {
         return await self.run(cmd);
     }
 
+    // runWrite's twin for a KIND-1 document sequence: `bodyCmd` is the command body (no array), `docs`
+    // ride in the sequence identified by `seqId`. Retryable-write context (lsid/txnNumber) and a
+    // reconnect-on-not-primary retry are applied to the body exactly as runWrite does; inside a
+    // transaction the sequence write joins the txn.
+    async fn runWriteSeq(self: Collection, bodyCmd: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>, retryable: bool): bson.BsonDocument {
+        let s = self.sess;
+        if (s != undefined) {
+            if (s.inTxn) {
+                bodyCmd.entries.push(lsidEntry(s.lsid));
+                bodyCmd.entries.push(bson.entryInt64Val("txnNumber", s.txnNumber));
+                bodyCmd.entries.push(bson.entryBool("autocommit", 0));
+                if (s.firstOp) { bodyCmd.entries.push(bson.entryBool("startTransaction", 1)); s.firstOp = false; }
+                return await self.conn.runCommandSeq(bodyCmd, seqId, docs);
+            }
+        }
+        if (retryable && self.conn.retryWrites && self.conn.setName != "") {
+            await self.conn.ensureImplicitSession();
+            if (self.conn.implicitLsid != "") {
+                bodyCmd.entries.push(lsidEntry(self.conn.implicitLsid));
+                bodyCmd.entries.push(bson.entryInt64Val("txnNumber", self.conn.nextImplicitTxn()));
+                let reply = await self.conn.runCommandSeq(bodyCmd, seqId, docs);
+                if (isRetryableReply(reply)) {
+                    if (isNotPrimaryReply(reply) && self.conn.wantsPrimary) {
+                        if (await self.conn.reconnect()) { return await self.conn.runCommandSeq(bodyCmd, seqId, docs); }
+                    }
+                    return await self.conn.runCommandSeq(bodyCmd, seqId, docs);
+                }
+                return reply;
+            }
+        }
+        return await self.conn.runCommandSeqFailover(bodyCmd, seqId, docs);
+    }
+
     // find with server-side filter/projection/sort/skip/limit; returns a lazy Cursor.
     pub async fn find(self: Collection, f: document.Filter, opts: document.FindOptions): Cursor {
         let cmd = commands.findCommandFull(self.dbName, self.coll, f.toBson(), opts.projection, opts.sort, opts.skip, opts.limit, opts.batchSize);
@@ -807,8 +863,10 @@ pub struct Collection {
             bdocs.push(d.bson);
             i = i + 1;
         }
-        // Inserts are retryable writes (a single batch is idempotent under the same txnNumber).
-        let reply = await self.runWrite(commands.insertManyCommand(self.dbName, self.coll, bdocs), true);
+        // Inserts are retryable writes (a batch is idempotent under the same txnNumber). The documents ride
+        // in a KIND-1 OP_MSG document sequence (no array nested in the command body) -- the wire-efficient
+        // bulk form.
+        let reply = await self.runWriteSeq(commands.insertBodyCommand(self.dbName, self.coll, true), "documents", bdocs, true);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.insertedCount = numAt(reply, "n");
