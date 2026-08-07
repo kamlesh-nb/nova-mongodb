@@ -72,6 +72,11 @@ pub struct MongoConnection impl Connection {
     pub setName: string,         // the replica-set name the server reports ("" for a standalone)
     pub serverHost: string,      // the host:port we are actually connected to (the selected node)
     pub members: List<string>,   // all replica-set members the primary advertised (host:port)
+    // Retryable writes: an implicit session (lsid) + a monotonic txnNumber ride on eligible single-doc
+    // writes so a transient failure can be retried once, idempotently (the server dedups by lsid+txnNumber).
+    pub retryWrites: bool,       // honour retryable writes (default true; DSN retryWrites=false disables)
+    pub implicitLsid: string,    // lazily created implicit-session lsid ("" until first retryable write)
+    pub implicitTxn: long,       // monotonic txnNumber for the implicit session
 
     init(io: aio.AsyncIO, dbName: string) {
         self.io = io;
@@ -83,7 +88,20 @@ pub struct MongoConnection impl Connection {
         self.setName = "";
         self.serverHost = "";
         self.members = List<string>();
+        self.retryWrites = true;
+        self.implicitLsid = "";
+        self.implicitTxn = 0;
     }
+    // Lazily create the implicit session used to tag retryable writes (once per connection). Reuses the
+    // server-assigned lsid, trimmed to its declared BSON length (see trimBsonDoc / lsidEntry).
+    async fn ensureImplicitSession(self: MongoConnection): void {
+        if (self.implicitLsid != "") { return; }
+        let reply = await self.runCommand(commands.startSessionCommand());
+        let idIdx = bson.docFind(reply, "id");
+        if (idIdx >= 0) { self.implicitLsid = trimBsonDoc(bson.docGetDoc(reply, idIdx)); }
+    }
+    // Next txnNumber for the implicit session (a fresh one per retryable write).
+    fn nextImplicitTxn(self: MongoConnection): long { self.implicitTxn = self.implicitTxn + 1; return self.implicitTxn; }
     // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
     // instead of pretending to be live (auth used to be checked-but-ignored).
     pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
@@ -362,6 +380,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
     let caPem = if (verify && caFile != "") File.readText(caFile) else "";
     let replicaSet = dsnParam(dsn, "replicaSet", "");
     let readPref = parseReadPref(dsnParam(dsn, "readPreference", "primary"));
+    let retryWrites = !string.eql(dsnParam(dsn, "retryWrites", "true"), "false");
     let isSrv = string.indexOf(dsn, "mongodb+srv://") == 0;
 
     let base = dsn;
@@ -419,6 +438,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         if (info.ok && string.eql(target, seed) && info.isPrimary) {
             let c = await finishAuth(probe, user, pass);
             c.setTopology(info.setName, seed, info.hosts);
+            c.retryWrites = retryWrites;
             return c;
         }
         let thp = splitHostPort(target);
@@ -427,6 +447,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         if (!tinfo.ok) { lastErr = "read-preference target " + target + " unreachable"; continue; }
         let c = await finishAuth(tconn, user, pass);
         c.setTopology(tinfo.setName, target, tinfo.hosts);
+        c.retryWrites = retryWrites;
         return c;
     }
     return deadConn(dbName, "mongodb: could not reach a usable node (" + lastErr + ")");
@@ -520,6 +541,24 @@ pub struct Cursor {
     }
 }
 
+// Error codes that mark a write as safe to retry (the retryable-writes spec's retryable set): network /
+// not-writable-primary / interrupted-at-shutdown / stepped-down and friends. NOT duplicate-key (11000)
+// or validation (121) -- retrying those cannot help.
+fn isRetryableCode(code: int): bool {
+    return code == 6 || code == 7 || code == 89 || code == 91 || code == 189 || code == 262
+        || code == 9001 || code == 10107 || code == 11600 || code == 11602 || code == 13435 || code == 13436;
+}
+
+// Should the reply to a write be retried? A dropped connection surfaces as an EMPTY reply (readFrame ""
+// on the dead socket), which is retryable; otherwise the write's error code decides.
+fn isRetryableReply(reply: bson.BsonDocument): bool {
+    if (bson.docFind(reply, "ok") < 0 && bson.docFind(reply, "n") < 0
+        && bson.docFind(reply, "errmsg") < 0 && bson.docFind(reply, "writeErrors") < 0) { return true; }
+    let e = commands.writeError(reply);
+    if (e.isEmpty()) { return false; }
+    return isRetryableCode(e.number);
+}
+
 pub struct Collection {
     pub conn: MongoConnection,
     pub dbName: string,
@@ -542,6 +581,30 @@ pub struct Collection {
             }
         }
         return await self.conn.runCommand(cmd);
+    }
+
+    // Run a write, applying retryable-writes semantics. Inside an explicit transaction the write joins
+    // the transaction (via run, no retry layer). Otherwise, when eligible (retryable single-doc write,
+    // retryWrites on, and the server supports sessions -- i.e. a replica set / mongos, setName != ""),
+    // an implicit-session lsid + a fresh txnNumber are attached and the write is retried ONCE on a
+    // retryable error; the same txnNumber makes the retry idempotent (the server dedups). A standalone
+    // (setName == "") or a disabled/ineligible write falls back to a plain, un-tagged send.
+    async fn runWrite(self: Collection, cmd: bson.BsonDocument, retryable: bool): bson.BsonDocument {
+        let s = self.sess;
+        if (s != undefined) {
+            if (s.inTxn) { return await self.run(cmd); }
+        }
+        if (retryable && self.conn.retryWrites && self.conn.setName != "") {
+            await self.conn.ensureImplicitSession();
+            if (self.conn.implicitLsid != "") {
+                cmd.entries.push(lsidEntry(self.conn.implicitLsid));
+                cmd.entries.push(bson.entryInt64Val("txnNumber", self.conn.nextImplicitTxn()));
+                let reply = await self.conn.runCommand(cmd);
+                if (isRetryableReply(reply)) { return await self.conn.runCommand(cmd); }  // retry once, same txnNumber
+                return reply;
+            }
+        }
+        return await self.run(cmd);
     }
 
     // find with server-side filter/projection/sort/skip/limit; returns a lazy Cursor.
@@ -592,7 +655,8 @@ pub struct Collection {
             bdocs.push(d.bson);
             i = i + 1;
         }
-        let reply = await self.run(commands.insertManyCommand(self.dbName, self.coll, bdocs));
+        // Inserts are retryable writes (a single batch is idempotent under the same txnNumber).
+        let reply = await self.runWrite(commands.insertManyCommand(self.dbName, self.coll, bdocs), true);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.insertedCount = numAt(reply, "n");
@@ -611,7 +675,8 @@ pub struct Collection {
     }
     async fn doUpdate(self: Collection, f: document.Filter, updateBson: bson.BsonDocument, upsert: bool, multi: bool): UpdateResult {
         let res = UpdateResult();
-        let reply = await self.run(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi));
+        // A single-document update (multi == false) is retryable; a multi update is not.
+        let reply = await self.runWrite(commands.updateCommand(self.dbName, self.coll, f.toBson(), updateBson, upsert, multi), !multi);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.matched = numAt(reply, "n");
@@ -632,7 +697,8 @@ pub struct Collection {
     pub async fn deleteMany(self: Collection, f: document.Filter): DeleteResult { return await self.doDelete(f, 0); }
     async fn doDelete(self: Collection, f: document.Filter, limit: int): DeleteResult {
         let res = DeleteResult();
-        let reply = await self.run(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit));
+        // A single-document delete (limit == 1) is retryable; an unlimited delete is not.
+        let reply = await self.runWrite(commands.deleteCommand(self.dbName, self.coll, f.toBson(), limit), limit == 1);
         let e = commands.writeError(reply);
         if (!e.isEmpty()) { res.err = e; return res; }
         res.deletedCount = numAt(reply, "n");
@@ -642,7 +708,8 @@ pub struct Collection {
     // Atomically update the first match and return the pre- or post-image (returnNew), or undefined
     // if nothing matched (and no upsert).
     pub async fn findOneAndUpdate(self: Collection, f: document.Filter, u: document.Update, returnNew: bool, upsert: bool): document.Doc | undefined {
-        let reply = await self.run(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert));
+        // findAndModify targets a single document, so it is retryable.
+        let reply = await self.runWrite(commands.findAndModifyCommand(self.dbName, self.coll, f.toBson(), u.toBson(), returnNew, upsert), true);
         let vIdx = bson.docFind(reply, "value");
         if (vIdx < 0 || bson.docGetType(reply, vIdx) != 3) { return undefined; }   // absent / null (type 10)
         return document.wrapDoc(bson.deserialize(bson.docGetDoc(reply, vIdx) as ptr));
