@@ -24,6 +24,7 @@ import io.file;
 import db;
 import codec;
 import commands;
+import document;
 
 // ---------------------------------------------------------------------------
 // Live socket framing
@@ -79,6 +80,11 @@ pub struct MongoConnection impl Connection {
     // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
     // instead of pretending to be live (auth used to be checked-but-ignored).
     pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
+
+    // The native document API entry point: `conn.database("shop").collection("users").find(...)`.
+    pub fn database(self: MongoConnection, name: string): Database { return Database(self, name); }
+    // The database named in the DSN (used to connect/auth).
+    pub fn defaultDatabase(self: MongoConnection): Database { return Database(self, self.dbName); }
 
     // Send one OP_MSG command and await the reply (the recv parks the coroutine).
     pub async fn runCommand(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
@@ -257,3 +263,130 @@ pub struct MongoDriver impl Driver {
         return await mongoConnectAsync(dsn);   // sync trait method drives the async connect once
     }
 }
+
+// --- native document API: Database / Collection / Cursor (P2 read path) --------------------------
+
+// One page of a cursor reply: the (possibly zero) server cursor id + the batch of documents.
+struct CursorPage {
+    pub cursorId: long,
+    pub docs: List<document.Doc>,
+    init() { self.cursorId = 0; self.docs = List<document.Doc>(); }
+}
+// Extract (cursor.id, <batchKey> array of Docs) from a find/getMore reply. batchKey = "firstBatch"
+// (find) or "nextBatch" (getMore).
+fn readCursorReply(reply: bson.BsonDocument, batchKey: string): CursorPage {
+    let cp = CursorPage();
+    let cursorIdx = bson.docFind(reply, "cursor");
+    if (cursorIdx < 0) { return cp; }
+    let cursorDoc = bson.deserialize(bson.docGetDoc(reply, cursorIdx) as ptr);
+    let idIdx = bson.docFind(cursorDoc, "id");
+    if (idIdx >= 0) { cp.cursorId = bson.docGetInt64(cursorDoc, idIdx); }
+    let bIdx = bson.docFind(cursorDoc, batchKey);
+    if (bIdx < 0) { return cp; }
+    let arr = bson.deserialize(bson.docGetArray(cursorDoc, bIdx) as ptr);
+    let i = 0;
+    while (i < arr.entries.size()) {
+        cp.docs.push(document.wrapDoc(bson.deserialize(bson.docGetDoc(arr, i) as ptr)));
+        i = i + 1;
+    }
+    return cp;
+}
+
+// A lazy cursor over a query result. Yields the buffered batch, then getMore's the next one until the
+// server cursor id is 0 (exhausted); killCursors on close() if it was not fully drained.
+pub struct Cursor {
+    pub conn: MongoConnection,
+    pub dbName: string,
+    pub coll: string,
+    pub cursorId: long,
+    pub batch: List<document.Doc>,
+    pub pos: int,
+    pub err: DbError,
+    init(conn: MongoConnection, dbName: string, coll: string) {
+        self.conn = conn; self.dbName = dbName; self.coll = coll;
+        self.cursorId = 0; self.batch = List<document.Doc>(); self.pos = 0; self.err = db.noError();
+    }
+    pub fn ok(self: Cursor): bool { return self.err.isEmpty(); }
+
+    // The next document, or undefined when the cursor is exhausted. Drives getMore transparently.
+    pub async fn next(self: Cursor): document.Doc | undefined {
+        if (self.pos < self.batch.size()) { let d = self.batch.get(self.pos) ?? document.doc(); self.pos = self.pos + 1; return d; }
+        if (self.cursorId == 0) { return undefined; }
+        let reply = await self.conn.runCommand(commands.getMoreCommand(self.dbName, self.coll, self.cursorId, 101));
+        let e = commands.commandError(reply);
+        if (!e.isEmpty()) { self.err = e; self.cursorId = 0; return undefined; }
+        let page = readCursorReply(reply, "nextBatch");
+        self.cursorId = page.cursorId;
+        self.batch = page.docs;
+        self.pos = 0;
+        if (self.batch.size() == 0) { return undefined; }
+        let d2 = self.batch.get(0) ?? document.doc();
+        self.pos = 1;
+        return d2;
+    }
+    // Eager drain of the whole result into a list (bounded by the result size).
+    pub async fn toList(self: Cursor): List<document.Doc> {
+        let out = List<document.Doc>();
+        while (true) {
+            let dn = await self.next();
+            if (dn == undefined) { break; }
+            out.push(dn);
+        }
+        return out;
+    }
+    // Release a not-yet-exhausted server cursor.
+    pub async fn close(self: Cursor): void {
+        if (self.cursorId != 0) {
+            let _ = await self.conn.runCommand(commands.killCursorsCommand(self.dbName, self.coll, self.cursorId));
+            self.cursorId = 0;
+        }
+    }
+}
+
+pub struct Collection {
+    pub conn: MongoConnection,
+    pub dbName: string,
+    pub coll: string,
+    init(conn: MongoConnection, dbName: string, coll: string) { self.conn = conn; self.dbName = dbName; self.coll = coll; }
+
+    // find with server-side filter/projection/sort/skip/limit; returns a lazy Cursor.
+    pub async fn find(self: Collection, f: document.Filter, opts: document.FindOptions): Cursor {
+        let cmd = commands.findCommandFull(self.dbName, self.coll, f.toBson(), opts.projection, opts.sort, opts.skip, opts.limit, opts.batchSize);
+        let reply = await self.conn.runCommand(cmd);
+        let cur = Cursor(self.conn, self.dbName, self.coll);
+        let e = commands.commandError(reply);
+        if (!e.isEmpty()) { cur.err = e; return cur; }
+        let page = readCursorReply(reply, "firstBatch");
+        cur.cursorId = page.cursorId;
+        cur.batch = page.docs;
+        return cur;
+    }
+    // The first matching document (limit 1), or undefined.
+    pub async fn findOne(self: Collection, f: document.Filter): document.Doc | undefined {
+        let cur = await self.find(f, document.findOptions().withLimit(1));
+        let d = await cur.next();
+        let _ = await cur.close();
+        return d;
+    }
+    // Whole-collection convenience: find(all()).
+    pub async fn findAll(self: Collection): Cursor { return await self.find(document.all(), document.findOptions()); }
+}
+
+pub struct Database {
+    pub conn: MongoConnection,
+    pub name: string,
+    init(conn: MongoConnection, name: string) { self.conn = conn; self.name = name; }
+    pub fn collection(self: Database, coll: string): Collection { return Collection(self.conn, self.name, coll); }
+}
+
+// --- native document API entry points (re-exported so consumers only `import mongodb`) -----------
+
+// Connect and return the CONCRETE MongoConnection (the document API hangs off it). The seam's
+// Driver.connect returns the Connection trait, which cannot reach database()/collection().
+pub async fn open(dsn: string): MongoConnection { return await mongoConnectAsync(dsn); }
+
+// Builder re-exports: `mongodb.filter().eqInt(...)`, `mongodb.findOptions().sortAsc(...)`, `mongodb.doc()`.
+pub fn filter(): document.Filter { return document.filter(); }
+pub fn all(): document.Filter { return document.all(); }
+pub fn doc(): document.Doc { return document.doc(); }
+pub fn findOptions(): document.FindOptions { return document.findOptions(); }

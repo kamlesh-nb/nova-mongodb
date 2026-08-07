@@ -48,6 +48,43 @@ pub fn findCommand(dbName: string, coll: string, filter: bson.BsonDocument): bso
     return d;
 }
 
+/// A full find with server-side filter/projection/sort/skip/limit + batchSize. Empty projection/sort
+/// docs and skip/limit == 0 are omitted (their absence is the "unset" wire meaning).
+pub fn findCommandFull(dbName: string, coll: string, filter: bson.BsonDocument, projection: bson.BsonDocument,
+                       sort: bson.BsonDocument, skip: long, limit: long, batchSize: int): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("find", coll));
+    d.entries.push(bson.entryDoc("filter", bson.serialize(filter)));
+    if (projection.entries.size() > 0) { d.entries.push(bson.entryDoc("projection", bson.serialize(projection))); }
+    if (sort.entries.size() > 0) { d.entries.push(bson.entryDoc("sort", bson.serialize(sort))); }
+    if (skip > 0) { d.entries.push(bson.entryInt64Val("skip", skip)); }
+    if (limit > 0) { d.entries.push(bson.entryInt64Val("limit", limit)); }
+    d.entries.push(bson.entryInt("batchSize", batchSize));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { getMore: <cursorId int64>, collection: <coll>, batchSize, $db } — fetch the next cursor batch.
+pub fn getMoreCommand(dbName: string, coll: string, cursorId: long, batchSize: int): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryInt64Val("getMore", cursorId));
+    d.entries.push(bson.entryString("collection", coll));
+    d.entries.push(bson.entryInt("batchSize", batchSize));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
+/// { killCursors: <coll>, cursors: [<cursorId int64>], $db } — release a not-yet-exhausted cursor.
+pub fn killCursorsCommand(dbName: string, coll: string, cursorId: long): bson.BsonDocument {
+    let d = newDoc();
+    d.entries.push(bson.entryString("killCursors", coll));
+    let arr = newDoc();
+    arr.entries.push(bson.entryInt64Val("0", cursorId));
+    d.entries.push(bson.entryArray("cursors", bson.serialize(arr)));
+    d.entries.push(bson.entryString("$db", dbName));
+    return d;
+}
+
 /// { saslStart: 1, mechanism: "SCRAM-SHA-256", payload: <bin>, $db: <db> }.
 pub fn saslStartCommand(dbName: string, clientFirst: string): bson.BsonDocument {
     let d = newDoc();

@@ -1,0 +1,152 @@
+// document — the typed MongoDB document model (SRP: BSON ergonomics, no wire/IO). `Doc` wraps a
+// bson.BsonDocument with typed build + read; `Filter` is a fluent query builder that lowers to a BSON
+// filter document; `FindOptions` carries projection/sort/skip/limit/batchSize. All pure over BSON, so
+// this module has no dependency on the connection and can be unit-gated offline.
+import list;
+import string;
+import serde.bson;
+
+// --- Doc: a typed document (read + build) ------------------------------------------------------
+
+pub struct Doc {
+    pub bson: bson.BsonDocument,
+    init() { self.bson = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() }; }
+
+    // -- build (fluent) --
+    pub fn setStr(self: Doc, key: string, v: string): Doc { self.bson.entries.push(bson.entryString(key, v)); return self; }
+    pub fn setInt(self: Doc, key: string, v: long): Doc { self.bson.entries.push(bson.entryInt64Val(key, v)); return self; }
+    pub fn setDouble(self: Doc, key: string, v: double): Doc { self.bson.entries.push(bson.entryDoubleVal(key, v)); return self; }
+    pub fn setBool(self: Doc, key: string, v: bool): Doc { self.bson.entries.push(bson.entryBool(key, if (v) 1 else 0)); return self; }
+    pub fn setObjectId(self: Doc, key: string, hex: string): Doc { self.bson.entries.push(bson.entryObjectId(key, hex)); return self; }
+    pub fn setDate(self: Doc, key: string, millis: long): Doc { self.bson.entries.push(bson.entryDate(key, millis)); return self; }
+    pub fn setDoc(self: Doc, key: string, v: Doc): Doc { self.bson.entries.push(bson.entryDoc(key, bson.serialize(v.bson))); return self; }
+    pub fn setNull(self: Doc, key: string): Doc { self.bson.entries.push(bson.entryNull(key)); return self; }
+
+    // -- read (typed, NULL-/missing-/wrong-type-safe: return undefined) --
+    pub fn has(self: Doc, key: string): bool { return bson.docFind(self.bson, key) >= 0; }
+    pub fn getStr(self: Doc, key: string): string | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 2) { return undefined; }
+        return bson.docGetString(self.bson, i);
+    }
+    pub fn getInt(self: Doc, key: string): long | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0) { return undefined; }
+        let t = bson.docGetType(self.bson, i);
+        if (t != 16 && t != 18) { return undefined; }
+        return bson.docGetInt64(self.bson, i);
+    }
+    pub fn getDouble(self: Doc, key: string): double | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 1) { return undefined; }
+        return bson.docGetDouble(self.bson, i);
+    }
+    pub fn getBool(self: Doc, key: string): bool | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 8) { return undefined; }
+        return bson.docGetBool(self.bson, i) != 0;
+    }
+    pub fn getObjectId(self: Doc, key: string): string | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 7) { return undefined; }
+        return bson.docGetObjectId(self.bson, i);
+    }
+    pub fn getDate(self: Doc, key: string): long | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 9) { return undefined; }
+        return bson.docGetDate(self.bson, i);
+    }
+    pub fn getDoc(self: Doc, key: string): Doc | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 3) { return undefined; }
+        return wrapDoc(bson.deserialize(bson.docGetDoc(self.bson, i) as ptr));
+    }
+    pub fn toJson(self: Doc): string { return bson.docToJson(self.bson); }
+}
+
+pub fn doc(): Doc { return Doc(); }
+pub fn wrapDoc(b: bson.BsonDocument): Doc { let d = Doc(); d.bson = b; return d; }
+
+// --- Filter: a fluent query builder that lowers to a BSON filter document -----------------------
+
+pub struct Filter {
+    pub d: bson.BsonDocument,
+    init() { self.d = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() }; }
+
+    // Equality: { field: v }
+    pub fn eqStr(self: Filter, field: string, v: string): Filter { self.d.entries.push(bson.entryString(field, v)); return self; }
+    pub fn eqInt(self: Filter, field: string, v: long): Filter { self.d.entries.push(bson.entryInt64Val(field, v)); return self; }
+    pub fn eqBool(self: Filter, field: string, v: bool): Filter { self.d.entries.push(bson.entryBool(field, if (v) 1 else 0)); return self; }
+    pub fn eqObjectId(self: Filter, field: string, hex: string): Filter { self.d.entries.push(bson.entryObjectId(field, hex)); return self; }
+
+    // Comparison: { field: { $op: v } }
+    pub fn gtInt(self: Filter, field: string, v: long): Filter { return self.opInt(field, "$gt", v); }
+    pub fn gteInt(self: Filter, field: string, v: long): Filter { return self.opInt(field, "$gte", v); }
+    pub fn ltInt(self: Filter, field: string, v: long): Filter { return self.opInt(field, "$lt", v); }
+    pub fn lteInt(self: Filter, field: string, v: long): Filter { return self.opInt(field, "$lte", v); }
+    pub fn neInt(self: Filter, field: string, v: long): Filter { return self.opInt(field, "$ne", v); }
+    // { field: { $regex: pattern } } — server-side regex match on a string field.
+    pub fn regexStr(self: Filter, field: string, pattern: string): Filter { return self.opStr(field, "$regex", pattern); }
+
+    // { field: { $in: [v0, v1, ...] } }
+    pub fn inStr(self: Filter, field: string, vs: List<string>): Filter {
+        let arr = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        let i = 0;
+        while (i < vs.size()) { arr.entries.push(bson.entryString(`${i}`, vs.get(i) ?? "")); i = i + 1; }
+        let sub = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        sub.entries.push(bson.entryArray("$in", bson.serialize(arr)));
+        self.d.entries.push(bson.entryDoc(field, bson.serialize(sub)));
+        return self;
+    }
+
+    // Escape hatch: merge an arbitrary Doc's fields into the filter (for operators not yet wrapped).
+    pub fn raw(self: Filter, extra: Doc): Filter {
+        let i = 0;
+        while (i < extra.bson.entries.size()) { self.d.entries.push(extra.bson.entries.at(i)); i = i + 1; }
+        return self;
+    }
+
+    fn opInt(self: Filter, field: string, op: string, v: long): Filter {
+        let sub = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        sub.entries.push(bson.entryInt64Val(op, v));
+        self.d.entries.push(bson.entryDoc(field, bson.serialize(sub)));
+        return self;
+    }
+    fn opStr(self: Filter, field: string, op: string, v: string): Filter {
+        let sub = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        sub.entries.push(bson.entryString(op, v));
+        self.d.entries.push(bson.entryDoc(field, bson.serialize(sub)));
+        return self;
+    }
+    pub fn toBson(self: Filter): bson.BsonDocument { return self.d; }
+}
+
+pub fn filter(): Filter { return Filter(); }
+pub fn all(): Filter { return Filter(); }   // {} matches every document
+
+// --- FindOptions: projection / sort / skip / limit / batchSize ----------------------------------
+
+pub struct FindOptions {
+    pub projection: bson.BsonDocument,
+    pub sort: bson.BsonDocument,
+    pub skip: long,
+    pub limit: long,
+    pub batchSize: int,
+    init() {
+        self.projection = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        self.sort = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+        self.skip = 0;
+        self.limit = 0;
+        self.batchSize = 101;
+    }
+    // 1 = ascending, -1 = descending
+    pub fn sortAsc(self: FindOptions, field: string): FindOptions { self.sort.entries.push(bson.entryInt(field, 1)); return self; }
+    pub fn sortDesc(self: FindOptions, field: string): FindOptions { self.sort.entries.push(bson.entryInt(field, 0 - 1)); return self; }
+    pub fn include(self: FindOptions, field: string): FindOptions { self.projection.entries.push(bson.entryInt(field, 1)); return self; }
+    pub fn exclude(self: FindOptions, field: string): FindOptions { self.projection.entries.push(bson.entryInt(field, 0)); return self; }
+    pub fn withSkip(self: FindOptions, n: long): FindOptions { self.skip = n; return self; }
+    pub fn withLimit(self: FindOptions, n: long): FindOptions { self.limit = n; return self; }
+    pub fn withBatchSize(self: FindOptions, n: int): FindOptions { self.batchSize = n; return self; }
+}
+
+pub fn findOptions(): FindOptions { return FindOptions(); }
