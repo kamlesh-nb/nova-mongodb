@@ -476,7 +476,17 @@ fn parseHello(reply: bson.BsonDocument): HelloInfo {
 // Open a raw async stream to host:port honouring the TLS options; widening to the AsyncIO seam.
 // MongoDB uses IMPLICIT TLS (encryption from the first byte), so tlsConnect[Verify] (TLS 1.3, pure
 // Nova) is the whole story; `tls=verify` enforces the certificate chain.
-async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: string, clientPem: string): aio.AsyncIO {
+// `?connect_timeout=<seconds>` (also accepts the MongoDB URI `connectTimeoutMS=<ms>`), default 10 s;
+// <= 0 waits forever. Bounds a dead/firewalled host at connect time (non-TLS path today; the TLS
+// connect helpers do not yet take a deadline).
+fn mongoConnectTimeoutMs(dsn: string): int {
+    let ms = string.parseI64(dsnParam(dsn, "connectTimeoutMS", "")) as int;
+    if (ms > 0) { return ms; }
+    let secs = string.parseI64(dsnParam(dsn, "connect_timeout", "10")) as int;
+    if (secs < 0) { return 0; }
+    return secs * 1000;
+}
+async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: string, clientPem: string, timeoutMs: int): aio.AsyncIO {
     if (useTls) {
         // A client certificate (MONGODB-X509 / tlsCertificateKeyFile) means mutual TLS: present it during
         // the handshake. certPem == keyPem here (MongoDB ships both in one tlsCertificateKeyFile).
@@ -484,7 +494,7 @@ async fn openStream(host: string, port: int, useTls: bool, verify: bool, caPem: 
         if (verify) { return await asynctls.tlsConnectVerify(host, port, caPem); }
         return await asynctls.tlsConnect(host, port, false);
     }
-    return await aio.asyncConnect(host, port);
+    return await aio.asyncConnectDeadline(host, port, timeoutMs);
 }
 
 // Authenticate an already-connected + hello'd connection. X.509 uses the TLS client cert (no password);
@@ -586,6 +596,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         if (string.eql(replicaSet, "")) { replicaSet = txtOption(sr.options, "replicaSet"); }
     }
 
+    let mongoToMs = mongoConnectTimeoutMs(dsn);
     let lastErr = "no seeds in DSN";
     let i = 0;
     while (i < seeds.size()) {
@@ -593,7 +604,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
         i = i + 1;
         if (seed == "") { continue; }
         let hp = splitHostPort(seed);
-        let probe = MongoConnection(await openStream(hp.host, hp.port, useTls, verify, caPem, clientPem), dbName);
+        let probe = MongoConnection(await openStream(hp.host, hp.port, useTls, verify, caPem, clientPem, mongoToMs), dbName);
         let info = parseHello(await probe.runCommand(operation.helloCommand(dbName)));
         if (!info.ok) { lastErr = "seed " + seed + " unreachable"; continue; }
         if (replicaSet != "" && info.setName != "" && !string.eql(info.setName, replicaSet)) {
@@ -618,7 +629,7 @@ async fn mongoConnectAsync(dsn: string): MongoConnection {
             return c;
         }
         let thp = splitHostPort(target);
-        let tconn = MongoConnection(await openStream(thp.host, thp.port, useTls, verify, caPem, clientPem), dbName);
+        let tconn = MongoConnection(await openStream(thp.host, thp.port, useTls, verify, caPem, clientPem, mongoToMs), dbName);
         let tinfo = parseHello(await tconn.runCommand(operation.helloCommand(dbName)));
         if (!tinfo.ok) { lastErr = "read-preference target " + target + " unreachable"; continue; }
         // Verify the target actually satisfies the read preference. A seed's `primary` field can be STALE
