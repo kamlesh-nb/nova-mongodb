@@ -22,6 +22,8 @@ pub struct Doc {
     pub fn setDate(self: Doc, key: string, millis: long): Doc { self.bson.entries.push(bson.entryDate(key, millis)); return self; }
     pub fn setDoc(self: Doc, key: string, v: Doc): Doc { self.bson.entries.push(bson.entryDoc(key, bson.serialize(v.bson))); return self; }
     pub fn setBinary(self: Doc, key: string, v: string): Doc { self.bson.entries.push(bson.entryBinary(key, v)); return self; }
+    // Binary with an explicit subtype (0x04 = UUID, 0x00 = generic, 0x80+ = user-defined).
+    pub fn setBinarySubtype(self: Doc, key: string, v: string, subtype: int): Doc { self.bson.entries.push(bson.entryBinarySubtype(key, v, subtype)); return self; }
     pub fn setNull(self: Doc, key: string): Doc { self.bson.entries.push(bson.entryNull(key)); return self; }
 
     // -- read (typed, NULL-/missing-/wrong-type-safe: return undefined) --
@@ -58,6 +60,12 @@ pub struct Doc {
         let i = bson.docFind(self.bson, key);
         if (i < 0 || bson.docGetType(self.bson, i) != 5) { return undefined; }
         return bson.docGetBinary(self.bson, i);
+    }
+    // The subtype byte of a binary field (0x04 UUID, 0x00 generic, ...); undefined when absent / not binary.
+    pub fn getBinarySubtype(self: Doc, key: string): int | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 5) { return undefined; }
+        return bson.docGetBinarySubtype(self.bson, i);
     }
     pub fn getDate(self: Doc, key: string): long | undefined {
         let i = bson.docFind(self.bson, key);
