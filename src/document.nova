@@ -68,6 +68,11 @@ pub struct Doc {
         if (i < 0 || bson.docGetType(self.bson, i) != 4) { return undefined; }
         return readValues(bson.deserialize(bson.docGetArray(self.bson, i) as ptr));
     }
+    pub fn getDecimal(self: Doc, key: string): decimal | undefined {
+        let i = bson.docFind(self.bson, key);
+        if (i < 0 || bson.docGetType(self.bson, i) != 19) { return undefined; }
+        return bson.docGetDecimal(self.bson, i);
+    }
     // Any field as a typed Value (undefined when the key is absent).
     pub fn getValue(self: Doc, key: string): Value | undefined {
         let i = bson.docFind(self.bson, key);
@@ -108,7 +113,7 @@ pub struct DocSource impl ValueSource {
     pub fn getInt(self: DocSource, key: string): long { return self.d.getInt(key) ?? 0; }
     pub fn getBool(self: DocSource, key: string): bool { return self.d.getBool(key) ?? false; }
     pub fn getFloat(self: DocSource, key: string): double { return self.d.getDouble(key) ?? 0.0; }
-    pub fn getDecimal(self: DocSource, key: string): decimal { return 0m; }   // BSON decimal128 read is a follow-on
+    pub fn getDecimal(self: DocSource, key: string): decimal { return self.d.getDecimal(key) ?? 0m; }
     pub fn getChild(self: DocSource, key: string): ValueSource {
         let c = self.d.getDoc(key);
         return DocSource(c ?? doc());
@@ -129,7 +134,11 @@ pub struct DocSource impl ValueSource {
         if (a != undefined) { let v = a.get(i); if (v != undefined) { return v.asInt() ?? 0; } }
         return 0;
     }
-    pub fn itemDecimal(self: DocSource, key: string, i: int): decimal { return 0m; }
+    pub fn itemDecimal(self: DocSource, key: string, i: int): decimal {
+        let a = self.d.getArray(key);
+        if (a != undefined) { let v = a.get(i); if (v != undefined) { return v.asDecimal() ?? 0m; } }
+        return 0m;
+    }
     pub fn itemChild(self: DocSource, key: string, i: int): ValueSource {
         let a = self.d.getArray(key);
         if (a != undefined) {
@@ -154,6 +163,7 @@ pub const V_BOOL: int = 8;
 pub const V_DATE: int = 9;
 pub const V_NULL: int = 10;
 pub const V_INT: int = 16;
+pub const V_DECIMAL: int = 19;
 
 // One typed value pulled out of a BSON array. Typed accessors return `T | undefined` (undefined when the
 // value is not of that type), so `distinct`/array reads keep their real types instead of stringifying.
@@ -162,13 +172,15 @@ pub struct Value {
     pub s: string,        // string / ObjectId hex; also the raw sub-document/array bytes for V_DOC/V_ARRAY
     pub i: long,          // int / int64 / date millis / bool (0 or 1)
     pub d: double,        // double
-    init(kind: int, s: string, i: long, d: double) { self.kind = kind; self.s = s; self.i = i; self.d = d; }
+    pub dec: decimal,     // decimal128 (V_DECIMAL)
+    init(kind: int, s: string, i: long, d: double) { self.kind = kind; self.s = s; self.i = i; self.d = d; self.dec = 0m; }
 
     pub fn typeTag(self: Value): int { return self.kind; }
     pub fn isNull(self: Value): bool { return self.kind == V_NULL; }
     pub fn asStr(self: Value): string | undefined { if (self.kind == V_STRING) { return self.s; } return undefined; }
     pub fn asInt(self: Value): long | undefined { if (self.kind == V_INT) { return self.i; } return undefined; }
     pub fn asDouble(self: Value): double | undefined { if (self.kind == V_DOUBLE) { return self.d; } return undefined; }
+    pub fn asDecimal(self: Value): decimal | undefined { if (self.kind == V_DECIMAL) { return self.dec; } return undefined; }
     pub fn asBool(self: Value): bool | undefined { if (self.kind == V_BOOL) { return self.i != 0; } return undefined; }
     pub fn asObjectId(self: Value): string | undefined { if (self.kind == V_OBJECTID) { return self.s; } return undefined; }
     pub fn asDate(self: Value): long | undefined { if (self.kind == V_DATE) { return self.i; } return undefined; }
@@ -180,6 +192,7 @@ pub struct Value {
         if (self.kind == V_STRING || self.kind == V_OBJECTID) { return self.s; }
         if (self.kind == V_INT || self.kind == V_DATE) { return `${self.i}`; }
         if (self.kind == V_DOUBLE) { return `${self.d}`; }
+        if (self.kind == V_DECIMAL) { return `${self.dec}`; }
         if (self.kind == V_BOOL) { return if (self.i != 0) "true" else "false"; }
         if (self.kind == V_NULL) { return "null"; }
         return "";
@@ -199,6 +212,7 @@ pub fn valueAt(arr: bson.BsonDocument, i: int): Value {
     if (t == 9) { return Value(V_DATE, "", bson.docGetDate(arr, i), 0.0); }
     if (t == 3) { return Value(V_DOC, bson.docGetDoc(arr, i), 0, 0.0); }
     if (t == 4) { return Value(V_ARRAY, bson.docGetArray(arr, i), 0, 0.0); }
+    if (t == 19) { let v = Value(V_DECIMAL, "", 0, 0.0); v.dec = bson.docGetDecimal(arr, i); return v; }
     if (t == 10) { return Value(V_NULL, "", 0, 0.0); }
     return Value(V_UNKNOWN, "", 0, 0.0);
 }
