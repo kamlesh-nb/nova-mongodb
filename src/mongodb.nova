@@ -171,6 +171,17 @@ pub struct MongoConnection impl Connection {
     }
     // Next txnNumber for the implicit session (a fresh one per retryable write).
     fn nextImplicitTxn(self: MongoConnection): long { self.implicitTxn = self.implicitTxn + 1; return self.implicitTxn; }
+    // Reactive auto-failover: run a command and, if a primary-seeking connection gets a "not primary" /
+    // dropped-connection reply, re-discover the new primary and retry ONCE transparently. This heals a
+    // stepped-down primary WITHOUT the caller doing anything -- the synchronous complement to the
+    // background monitor (retrying on the same, now-secondary socket would just fail again).
+    pub async fn runCommandFailover(self: MongoConnection, command: bson.BsonDocument): bson.BsonDocument {
+        let reply = await self.runCommand(command);
+        if (!self.wantsPrimary) { return reply; }
+        if (!isNotPrimaryReply(reply)) { return reply; }
+        if (!await self.reconnect()) { return reply; }   // no new primary yet -> surface the original error
+        return await self.runCommand(command);            // retry once on the new primary
+    }
     // Mark this connection dead (auth failure at connect). The first query/exec returns the reason
     // instead of pretending to be live (auth used to be checked-but-ignored).
     pub fn markFailed(self: MongoConnection, why: string): void { self.failed = true; self.failErr = why; }
@@ -661,11 +672,31 @@ fn isRetryableCode(code: int): bool {
 // Should the reply to a write be retried? A dropped connection surfaces as an EMPTY reply (readFrame ""
 // on the dead socket), which is retryable; otherwise the write's error code decides.
 fn isRetryableReply(reply: bson.BsonDocument): bool {
-    if (bson.docFind(reply, "ok") < 0 && bson.docFind(reply, "n") < 0
-        && bson.docFind(reply, "errmsg") < 0 && bson.docFind(reply, "writeErrors") < 0) { return true; }
+    if (isEmptyReply(reply)) { return true; }
     let e = commands.writeError(reply);
     if (e.isEmpty()) { return false; }
     return isRetryableCode(e.number);
+}
+
+// An empty reply = the connection dropped (readFrame "" -> decodeOpMsg produced a doc with no fields).
+fn isEmptyReply(reply: bson.BsonDocument): bool {
+    return bson.docFind(reply, "ok") < 0 && bson.docFind(reply, "n") < 0
+        && bson.docFind(reply, "errmsg") < 0 && bson.docFind(reply, "writeErrors") < 0;
+}
+
+// "Not primary" / stepped-down / shutdown codes: the current server can no longer serve a primary op, so
+// the fix is to FIND THE NEW PRIMARY (reconnect), not to retry on the same socket.
+fn isNotPrimaryCode(code: int): bool {
+    return code == 10107 || code == 13435 || code == 13436 || code == 11602 || code == 189
+        || code == 91 || code == 10058 || code == 11600;
+}
+
+// Does the reply say we have lost the primary (a not-primary error or a dropped connection)?
+fn isNotPrimaryReply(reply: bson.BsonDocument): bool {
+    if (isEmptyReply(reply)) { return true; }
+    let e = commands.writeError(reply);
+    if (e.isEmpty()) { return false; }
+    return isNotPrimaryCode(e.number);
 }
 
 pub struct Collection {
@@ -687,9 +718,11 @@ pub struct Collection {
                 cmd.entries.push(bson.entryInt64Val("txnNumber", s.txnNumber));
                 cmd.entries.push(bson.entryBool("autocommit", 0));
                 if (s.firstOp) { cmd.entries.push(bson.entryBool("startTransaction", 1)); s.firstOp = false; }
+                return await self.conn.runCommand(cmd);   // inside a transaction: no auto-failover
             }
         }
-        return await self.conn.runCommand(cmd);
+        // Reads + non-transactional commands auto-fail-over on a lost primary (reconnect + retry once).
+        return await self.conn.runCommandFailover(cmd);
     }
 
     // Run a write, applying retryable-writes semantics. Inside an explicit transaction the write joins
@@ -709,7 +742,13 @@ pub struct Collection {
                 cmd.entries.push(lsidEntry(self.conn.implicitLsid));
                 cmd.entries.push(bson.entryInt64Val("txnNumber", self.conn.nextImplicitTxn()));
                 let reply = await self.conn.runCommand(cmd);
-                if (isRetryableReply(reply)) { return await self.conn.runCommand(cmd); }  // retry once, same txnNumber
+                if (isRetryableReply(reply)) {
+                    // A lost primary needs the NEW primary (reconnect); a plain transient retries in place.
+                    if (isNotPrimaryReply(reply) && self.conn.wantsPrimary) {
+                        if (await self.conn.reconnect()) { return await self.conn.runCommand(cmd); }
+                    }
+                    return await self.conn.runCommand(cmd);   // retry once (same txnNumber; server dedups)
+                }
                 return reply;
             }
         }
