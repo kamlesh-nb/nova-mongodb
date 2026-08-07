@@ -95,6 +95,52 @@ pub struct MongoSink impl ValueSink {
 }
 pub fn newMongoSink(): MongoSink { return MongoSink(); }
 
+// --- Doc -> DTO: read a BSON document back into a @serializable struct via serde.bind<T> --------
+
+// A ValueSource over a Doc, so `serde.bind<T>` can deserialize a fetched Mongo document into a typed
+// struct (the read complement of MongoSink). Scalars map to Doc's typed getters; getChild reads a nested
+// sub-document; the item* methods walk an array field's typed Values (for List<primitive>/List<struct>).
+pub struct DocSource impl ValueSource {
+    pub d: Doc,
+    init(d: Doc) { self.d = d; }
+
+    pub fn getString(self: DocSource, key: string): string { return self.d.getStr(key) ?? ""; }
+    pub fn getInt(self: DocSource, key: string): long { return self.d.getInt(key) ?? 0; }
+    pub fn getBool(self: DocSource, key: string): bool { return self.d.getBool(key) ?? false; }
+    pub fn getFloat(self: DocSource, key: string): double { return self.d.getDouble(key) ?? 0.0; }
+    pub fn getDecimal(self: DocSource, key: string): decimal { return 0m; }   // BSON decimal128 read is a follow-on
+    pub fn getChild(self: DocSource, key: string): ValueSource {
+        let c = self.d.getDoc(key);
+        return DocSource(c ?? doc());
+    }
+    pub fn has(self: DocSource, key: string): bool { return self.d.has(key); }
+    pub fn arrayLen(self: DocSource, key: string): int {
+        let a = self.d.getArray(key);
+        if (a != undefined) { return a.size(); }
+        return 0;
+    }
+    pub fn itemString(self: DocSource, key: string, i: int): string {
+        let a = self.d.getArray(key);
+        if (a != undefined) { let v = a.get(i); if (v != undefined) { return v.asStr() ?? ""; } }
+        return "";
+    }
+    pub fn itemInt(self: DocSource, key: string, i: int): long {
+        let a = self.d.getArray(key);
+        if (a != undefined) { let v = a.get(i); if (v != undefined) { return v.asInt() ?? 0; } }
+        return 0;
+    }
+    pub fn itemDecimal(self: DocSource, key: string, i: int): decimal { return 0m; }
+    pub fn itemChild(self: DocSource, key: string, i: int): ValueSource {
+        let a = self.d.getArray(key);
+        if (a != undefined) {
+            let v = a.get(i);
+            if (v != undefined) { let sub = v.asDoc(); if (sub != undefined) { return DocSource(sub); } }
+        }
+        return DocSource(doc());
+    }
+}
+pub fn docSource(d: Doc): DocSource { return DocSource(d); }
+
 // --- Value: a typed BSON element (for distinct results and array elements) -----------------------
 
 // BSON type tags this Value models (int64 is normalized to V_INT). Unmodelled types read as V_UNKNOWN.

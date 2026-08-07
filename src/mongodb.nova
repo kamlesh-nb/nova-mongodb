@@ -957,6 +957,24 @@ pub fn docOf<T>(dto: T): document.Doc {
     serde.dump<T>(dto, sink);
     return document.wrapDoc(sink.d);
 }
+
+// Deserialize a fetched Doc into a @serializable struct DTO (the read complement of docOf). Also SYNC:
+// serde.bind<T> resolves the concrete type only outside an async frame, so fetch first (await), then bind:
+//   let items = mongodb.bindAll<Item>(await coll.find(f, opts).toList());
+//   let one   = mongodb.bindOne<Item>(await coll.findOne(f));   // findOne -> Doc | undefined
+pub fn bindOne<T>(d: document.Doc): T {
+    return serde.bind<T>(document.docSource(d));
+}
+pub fn bindAll<T>(docs: List<document.Doc>): List<T> {
+    let out = List<T>();
+    let i = 0;
+    while (i < docs.size()) {
+        let d = docs.get(i);
+        if (d != undefined) { out.push(serde.bind<T>(document.docSource(d))); }
+        i = i + 1;
+    }
+    return out;
+}
 pub fn findOptions(): document.FindOptions { return document.findOptions(); }
 pub fn update(): document.Update { return document.update(); }
 
