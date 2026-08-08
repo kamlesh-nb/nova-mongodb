@@ -25,6 +25,7 @@ import net.aio;
 import net.asynctls;
 import io.file;
 import db;
+import concurrency.asynclock;
 import wiremessage;
 import operation;
 import document;
@@ -69,7 +70,11 @@ pub struct MongoConnection impl Connection {
     pub io: aio.AsyncIO,
     pub dbName: string,
     pub nextId: int,
-    pub busy: bool,              // concurrency guard: one in-flight request per connection
+    pub busy: bool,              // legacy per-copy guard (superseded by `lock`); kept for API compat
+    // Serialises wire exchanges on the shared socket. A heap object, so it is SHARED across the by-value
+    // copies of this connection that flow into Database/Collection/Cursor -- concurrent requests queue on
+    // it and take turns over the one connection instead of interleaving frames (which corrupts the stream).
+    pub lock: asynclock.AsyncLock,
     pub failed: bool,            // set when connect/auth failed: the connection is dead
     pub failErr: string,         // the failure reason surfaced to the first query/exec
     // P6 topology observability: what the SDAM discovery resolved this connection to.
@@ -93,6 +98,7 @@ pub struct MongoConnection impl Connection {
         self.dbName = dbName;
         self.nextId = 1;
         self.busy = false;
+        self.lock = asynclock.AsyncLock();
         self.failed = false;
         self.failErr = "";
         self.setName = "";
@@ -244,11 +250,19 @@ pub struct MongoConnection impl Connection {
             e.entries.push(bson.entryString("errmsg", self.failErr));
             return e;
         }
+        // Serialise this wire exchange over the shared socket: a concurrent runCommand from another
+        // request would interleave its frames with ours and corrupt the stream. A coroutine that finds the
+        // lock held PARKS on the reactor and runs when the holder releases -- so a burst of concurrent
+        // requests takes turns over the one connection instead of racing it. runCommand is a leaf (never
+        // nested), so acquiring here cannot self-deadlock; the body is linear so release is always reached.
+        if (!self.lock.tryAcquire()) { await self.lock.acquireSlow(); }
         let id = self.nextId;
         self.nextId = id + 1;
         let frame = wiremessage.encodeOpMsg(id, command);
         let dummy = await self.io.sendStr(frame);
-        return wiremessage.decodeOpMsg(await readFrame(self.io));
+        let reply = wiremessage.decodeOpMsg(await readFrame(self.io));
+        self.lock.release();
+        return reply;
     }
 
     pub async fn authenticate(self: MongoConnection, username: string, password: string, clientNonce: string, sha1: bool): bool {
