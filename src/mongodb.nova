@@ -1022,6 +1022,38 @@ pub struct Collection {
     // Whole-collection convenience: find(all()).
     pub async fn findAll(self: Collection): Cursor { return await self.find(document.all(), document.findOptions()); }
 
+    // Materialised find: run the query and drain ALL batches into a plain list, awaiting ONLY on real
+    // server I/O (the initial find and each getMore) and draining every in-memory batch synchronously.
+    // This mirrors the SQL drivers' query() -> ResultSet -> synchronous iteration, which is the reliable
+    // shape on the async reactor: a per-row `await cur.next()` awaits a coroutine that completes without
+    // suspending when it serves from the in-memory batch, and that hot path stalls the caller on the
+    // reactor. Prefer findList over the lazy cursor for request handlers on the web reactor.
+    pub async fn findList(self: Collection, f: document.Filter, opts: document.FindOptions): List<document.Doc> {
+        let cur = await self.find(f, opts);
+        let out = List<document.Doc>();
+        let i = 0;
+        while (i < cur.batch.size()) {
+            let d = cur.batch.get(i);
+            if (d != undefined) { out.push(d); }
+            i = i + 1;
+        }
+        while (cur.cursorId != 0) {
+            let reply = await cur.conn.runCommand(operation.getMoreCommand(cur.dbName, cur.coll, cur.cursorId, 101));
+            let e = operation.commandError(reply);
+            if (!e.isEmpty()) { cur.err = e; cur.cursorId = 0; break; }
+            let page = readCursorReply(reply, "nextBatch");
+            cur.cursorId = page.cursorId;
+            cur.batch = page.docs;
+            let j = 0;
+            while (j < cur.batch.size()) {
+                let d2 = cur.batch.get(j);
+                if (d2 != undefined) { out.push(d2); }
+                j = j + 1;
+            }
+        }
+        return out;
+    }
+
     // -- writes (P3) --
 
     // Insert one document. Pass a @serializable struct DTO wrapped in `docOf(...)` -- it is serialized to
