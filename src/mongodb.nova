@@ -43,7 +43,7 @@ async fn readExact(io: aio.AsyncIO, n: int): string {
     let buf = bytes.alloc(n);
     let got = 0;
     while (got < n) {
-        let r = await io.recvInto((buf + got) as int, n - got);
+        let r = await io.recvInto((buf as long) + (got as long), n - got);
         if (r <= 0) { bytes.free(buf); return ""; }
         got = got + r;
     }
