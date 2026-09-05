@@ -5,7 +5,7 @@
 // drivers), bounded by a socket timeout, so a slow resolver cannot hang the caller indefinitely.
 //
 // The resolver address is the first `nameserver` in /etc/resolv.conf (falling back to 8.8.8.8:53), or an
-// explicit override via the NOVA_MONGO_DNS env var ("ip" or "ip:port") -- handy for a self-hosted /
+// explicit override via the KYTE_MONGO_DNS env var ("ip" or "ip:port") -- handy for a self-hosted /
 // test resolver. IPv6 nameservers and DNSSEC are out of scope.
 import bytes;
 import string;
@@ -90,9 +90,9 @@ fn writeQuery(buf: ptr, name: string, qtype: int, id: int): int {
     return pos;
 }
 
-// The resolver "ip:port": NOVA_MONGO_DNS override, else the first resolv.conf nameserver, else 8.8.8.8:53.
+// The resolver "ip:port": KYTE_MONGO_DNS override, else the first resolv.conf nameserver, else 8.8.8.8:53.
 fn dnsServer(): string {
-    let ov = string.trim(env.get("NOVA_MONGO_DNS"));
+    let ov = string.trim(env.get("KYTE_MONGO_DNS"));
     if (ov != "") { return if (string.indexOf(ov, ":") >= 0) ov else ov + ":53"; }
     let rc = File.readText("/etc/resolv.conf");
     let lines = string.split(rc, "\n");

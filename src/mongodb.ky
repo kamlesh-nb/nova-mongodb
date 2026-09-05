@@ -1,4 +1,4 @@
-// nova-mongodb — a MongoDB driver for Nova, distributed as a PACKAGE.
+// nova-mongodb — a MongoDB driver for Kyte, distributed as a PACKAGE.
 //
 // This module is the SEAM: MongoConnection (impl Connection) + MongoDriver (impl Driver)
 // + the connect/handshake/auth orchestration. Every other responsibility lives in its own
@@ -9,8 +9,8 @@
 //   dns          mongodb+srv:// SRV/TXT resolver
 //
 // Consumers only touch MongoDriver/MongoConnection: `import mongodb; MongoDriver()`.
-// It depends only on the Nova standard library (the DB seam + BSON + SCRAM crypto) and is
-// consumed via `nova get`. Auth is SCRAM-SHA-256 (RFC 5802/7677) via crypto.scram — the
+// It depends only on the Kyte standard library (the DB seam + BSON + SCRAM crypto) and is
+// consumed via `kyte get`. Auth is SCRAM-SHA-256 (RFC 5802/7677) via crypto.scram — the
 // payloads ride in BSON binary fields.
 
 import bytes;
@@ -145,7 +145,7 @@ pub struct MongoConnection impl Connection {
     // primary (we are no longer writable but the server names a different primary), re-discover and
     // reconnect to it. Returns true if the connection is healthy (or was healed) afterwards. This is the
     // per-check step of server monitoring; a background timer that calls it on an interval is a follow-on
-    // (Nova has no async sleep primitive yet).
+    // (Kyte has no async sleep primitive yet).
     pub async fn heartbeat(self: MongoConnection): bool {
         let info = parseHello(await self.runCommand(operation.helloCommand(self.dbName)));
         if (!info.ok) { return await self.reconnect(); }   // unreachable -> try to re-discover
@@ -475,7 +475,7 @@ fn parseHello(reply: bson.BsonDocument): HelloInfo {
 
 // Open a raw async stream to host:port honouring the TLS options; widening to the AsyncIO seam.
 // MongoDB uses IMPLICIT TLS (encryption from the first byte), so tlsConnect[Verify] (TLS 1.3, pure
-// Nova) is the whole story; `tls=verify` enforces the certificate chain.
+// Kyte) is the whole story; `tls=verify` enforces the certificate chain.
 // `?connect_timeout=<seconds>` (also accepts the MongoDB URI `connectTimeoutMS=<ms>`), default 10 s;
 // <= 0 waits forever. Bounds a dead/firewalled host at connect time (non-TLS path today; the TLS
 // connect helpers do not yet take a deadline).

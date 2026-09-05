@@ -1,12 +1,12 @@
 # nova-mongodb
 
-MongoDB driver for Nova (OP_MSG, BSON, SCRAM). A Nova package — fetch with:
+MongoDB driver for Kyte (OP_MSG, BSON, SCRAM). A Kyte package — fetch with:
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-mongodb
+kyte get https://github.com/kamlesh-nb/nova-mongodb
 ```
 
-```nova
+```kyte
 import mongodb;
 ```
 
